@@ -128,7 +128,7 @@ jobs:
         # Aqua Security folded its Terraform rule set into Trivy's misconfig
         # scanner (`scan-type: config`). This job IS the tfsec coverage; adding
         # a separate tfsec step today would only re-run stale rules.
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: .
