@@ -1,0 +1,91 @@
+{
+  "name": "afk-require-platform-tags",
+  "type": "Microsoft.Authorization/policyDefinitions",
+  "properties": {
+    "displayName": "Require the platform tag set on all indexed resources",
+    "description": "Denies the creation or update of any taggable (indexed) Azure resource that is missing one or more of the required platform tags. The required tag list is parameterised so the same definition can be reused across management groups. Mode is 'Indexed', which scopes evaluation to resource types that support both tags and location - resource groups and subscriptions are therefore NOT covered and need a companion assignment of the built-in 'Require a tag on resource groups' policy, or a second definition with mode 'All'.",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "metadata": {
+      "version": "1.1.0",
+      "category": "Tags",
+      "source": "https://github.com/fakhfakhahmed/terraform-azure-aks-platform",
+      "owner": "platform-engineering"
+    },
+    "parameters": {
+      "tagNames": {
+        "type": "Array",
+        "metadata": {
+          "displayName": "Required tag names",
+          "description": "The list of tag names that must be present and non-empty on every indexed resource. Must stay in sync with required_tags in policy/conftest/terraform.rego and with locals.common_tags in the environment root modules."
+        },
+        "defaultValue": [
+          "environment",
+          "project",
+          "owner",
+          "managed_by",
+          "cost_center"
+        ]
+      },
+      "effect": {
+        "type": "String",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Deny blocks non-compliant deployments outright. Audit records compliance state without blocking and is the correct first step when onboarding an existing subscription. Disabled turns the assignment off without deleting it."
+        },
+        "allowedValues": [
+          "Audit",
+          "Deny",
+          "Disabled"
+        ],
+        "defaultValue": "Deny"
+      },
+      "excludedResourceTypes": {
+        "type": "Array",
+        "metadata": {
+          "displayName": "Excluded resource types",
+          "description": "Resource types that are exempt from the tag requirement. Defaults cover AKS-managed node resource group children and other resources whose tags are owned by an Azure service rather than by Terraform."
+        },
+        "defaultValue": [
+          "Microsoft.ContainerService/managedClusters/agentPools",
+          "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+          "Microsoft.Network/networkInterfaces",
+          "Microsoft.Resources/deployments",
+          "Microsoft.Resources/deploymentScripts"
+        ]
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "notIn": "[parameters('excludedResourceTypes')]"
+          },
+          {
+            "count": {
+              "value": "[parameters('tagNames')]",
+              "name": "tagName",
+              "where": {
+                "anyOf": [
+                  {
+                    "field": "[concat('tags[', current('tagName'), ']')]",
+                    "exists": "false"
+                  },
+                  {
+                    "field": "[concat('tags[', current('tagName'), ']')]",
+                    "equals": ""
+                  }
+                ]
+              }
+            },
+            "greater": 0
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

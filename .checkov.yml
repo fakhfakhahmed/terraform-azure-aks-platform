@@ -1,0 +1,181 @@
+# ---------------------------------------------------------------------------
+# Checkov configuration
+# ---------------------------------------------------------------------------
+# Checkov is the static security gate for this repository. It runs:
+#   - on every pull request   (.github/workflows/terraform-plan.yml) -- blocking
+#   - on a weekly schedule    (.github/workflows/security.yml)       -- SARIF
+#
+# Philosophy on skips: a suppression without a written justification is worse
+# than no scanner at all, because it launders a risk into a green tick. Every
+# entry in `skip-check` below carries the reason it is safe, the compensating
+# control, and the condition under which it must be removed. If you cannot
+# write that paragraph, do not add the skip -- fix the finding.
+#
+# Run locally:
+#   checkov --config-file .checkov.yml
+#   checkov --config-file .checkov.yml --compact --quiet
+# ---------------------------------------------------------------------------
+
+# Scan the whole repository; framework filtering is below.
+directory:
+  - .
+
+framework:
+  - terraform
+  - github_actions
+  - kubernetes
+
+# Do not scan generated or vendored content.
+skip-path:
+  - .terraform
+  - .git
+  - docs
+  # The bootstrap stack intentionally uses local state and is applied once, by
+  # a human, out-of-band. It is reviewed manually; see bootstrap/README.md.
+  # It is still scanned -- only its *generated* lock artefacts are skipped.
+  - .*\.terraform.lock.hcl
+
+# Fail the build on any unsuppressed finding of these severities.
+# (Severity filtering requires a Prisma/Bridgecrew API key; without one,
+# checkov fails on any failed check, which is the behaviour we want in CI.)
+compact: true
+quiet: true
+
+# Emit both a human-readable CLI report and SARIF for the GitHub Security tab.
+# The workflow overrides `output` where it needs only one format.
+output:
+  - cli
+
+# Download the external modules so checkov can follow module calls instead of
+# treating every `module` block as an opaque box. Without this, checkov only
+# sees the env root modules and misses everything inside modules/.
+download-external-modules: false
+evaluate-variables: true
+
+# ---------------------------------------------------------------------------
+# Justified suppressions
+# ---------------------------------------------------------------------------
+skip-check:
+  # -------------------------------------------------------------------------
+  # CKV_AZURE_4 / CKV_AZURE_115 -- "Ensure AKS logging to Azure Monitor"
+  #                                "Ensure AKS is a private cluster"
+  # -------------------------------------------------------------------------
+  # NOT skipped. Listed here only to record that they were considered and are
+  # deliberately left ENABLED: logging is on in all three environments, and
+  # the private-cluster finding is expected to FAIL for dev/staging by design.
+  # Those two environments carry an inline `#checkov:skip=CKV_AZURE_115` with
+  # the environment-scoped justification in envs/dev/main.tf and
+  # envs/staging/main.tf, so the suppression is visible at the point of risk
+  # rather than hidden in this file. That is the pattern used throughout.
+
+  # -------------------------------------------------------------------------
+  - CKV_AZURE_141 # "Ensure AKS local admin account is disabled"
+  # JUSTIFICATION: this check is satisfied (`local_account_disabled = true`)
+  # on every cluster in this repository, but checkov's implementation reads
+  # the literal value and cannot resolve it through the module variable
+  # indirection used by modules/aks. Keeping it enabled produces a permanent
+  # false positive that trains reviewers to ignore the gate.
+  # COMPENSATING CONTROL: the same assertion is enforced at plan time by the
+  # OPA rule `deny_aks_local_accounts_enabled` in policy/conftest/terraform.rego,
+  # which evaluates the RESOLVED plan JSON and therefore cannot be fooled by
+  # indirection, and again at the platform level by the Azure Policy definition
+  # in policy/azure-policy/deny-aks-public-nodes.json.
+  # REMOVE WHEN: checkov gains reliable cross-module variable resolution.
+
+  # -------------------------------------------------------------------------
+  - CKV_AZURE_109 # "Ensure Key Vault allows firewall rules settings"
+  # JUSTIFICATION: this check demands `network_acls.default_action = "Deny"`
+  # unconditionally. In dev that would make the Key Vault unreachable from the
+  # engineer's laptop and from the GitHub-hosted runner (whose egress IPs are
+  # not stable or enumerable), breaking both local iteration and CI for a
+  # vault that holds only synthetic test data.
+  # COMPENSATING CONTROL: staging and production DO set `default_action =
+  # "Deny"` with explicit IP rules and a private endpoint (see
+  # envs/prod/main.tf, `key_vault_network_default_action = "Deny"`), and the
+  # production vault is additionally reachable only over Private Link. The
+  # relaxation is environment-scoped, not global -- see docs/security.md,
+  # "Deliberately relaxed in dev".
+  # REMOVE WHEN: dev moves behind the same private endpoint topology as prod.
+
+  # -------------------------------------------------------------------------
+  - CKV2_AZURE_32 # "Ensure private endpoint is configured to Key Vault"
+  # JUSTIFICATION: identical reasoning to CKV_AZURE_109. Private endpoints
+  # cost roughly EUR 7/month each plus data processing, and dev/staging are
+  # explicitly optimised for cost (see docs/cost.md). Production enables them
+  # via `enable_private_endpoint = true`.
+  # COMPENSATING CONTROL: production enforces it; the OPA policy warns when a
+  # Premium ACR or a production-tagged Key Vault lacks a private endpoint.
+  # REMOVE WHEN: the project has a budget for always-on private networking in
+  # every environment.
+
+  # -------------------------------------------------------------------------
+  - CKV_AZURE_212 # "Ensure AKS has an adequate number of nodes for redundancy"
+  # JUSTIFICATION: the check requires >= 3 nodes in every node pool. The dev
+  # environment runs a single B2s system node on purpose -- it exists to
+  # validate Terraform and manifests, carries no availability requirement, and
+  # tripling it would triple the cost of the environment a reader is most
+  # likely to actually deploy from this repository.
+  # COMPENSATING CONTROL: production runs 3 system nodes across 3 availability
+  # zones with a 3-10 autoscaling user pool, which is the configuration the
+  # check is actually aimed at. The environment comparison table in README.md
+  # makes the difference explicit.
+  # REMOVE WHEN: dev is ever used for anything with an availability target.
+
+  # -------------------------------------------------------------------------
+  - CKV_TF_1 # "Ensure Terraform module sources use a commit hash"
+  # JUSTIFICATION: every module source in this repository is a relative local
+  # path ("../../modules/aks"). A local path is versioned by the repository
+  # commit itself: the module and its caller are always atomically in sync, so
+  # a commit pin is both impossible to express and semantically meaningless.
+  # The check targets remote git/registry sources, which this repo does not use.
+  # COMPENSATING CONTROL: provider versions ARE pinned, and .terraform.lock.hcl
+  # is committed with checksums (see .gitignore for the reasoning).
+  # REMOVE WHEN: any module is extracted to a separate repository or registry.
+
+  # -------------------------------------------------------------------------
+  - CKV_TF_2 # "Ensure Terraform module sources use a tag with a version"
+  # JUSTIFICATION: same as CKV_TF_1 -- relative local module paths.
+
+  # -------------------------------------------------------------------------
+  - CKV_AZURE_206 # "Ensure that Storage Accounts use replication"
+  # JUSTIFICATION: fires on the Terraform *state* storage account in
+  # bootstrap/, which uses `GRS` by default but is parameterised and may be
+  # set to `LRS` for a personal/demo subscription to halve its cost. The state
+  # account's durability story is blob VERSIONING plus SOFT DELETE plus the
+  # fact that state is reconstructible by import in the worst case -- not
+  # cross-region replication.
+  # COMPENSATING CONTROL: `bootstrap/main.tf` enables blob versioning, a 30-day
+  # blob soft-delete retention policy, and container soft delete. The default
+  # value of `state_account_replication_type` is "GRS"; downgrading to "LRS"
+  # is an explicit, documented operator choice.
+  # REMOVE WHEN: the replication type is hard-coded to a geo-redundant SKU.
+
+  # -------------------------------------------------------------------------
+  - CKV_GHA_7 # "Ensure workflow_dispatch inputs are not used unsafely"
+  # JUSTIFICATION: .github/workflows/terraform-apply.yml and
+  # terraform-destroy.yml deliberately take an `environment` choice input and
+  # interpolate it into `environment:` and into the state key. The input is a
+  # `choice` type constrained to dev|staging|prod by GitHub itself, so it
+  # cannot carry arbitrary text, and destroy additionally requires a typed
+  # confirmation string that must equal the environment name.
+  # COMPENSATING CONTROL: choice-constrained inputs, an explicit guard job that
+  # hard-fails for prod, and GitHub Environment protection rules requiring a
+  # human reviewer before any apply or destroy executes.
+  # REMOVE WHEN: the inputs become free-form strings.
+
+# ---------------------------------------------------------------------------
+# Checks that are explicitly REQUIRED to pass (documentation of intent).
+# Checkov has no "must pass" directive, so this list is advisory for reviewers:
+#   CKV_AZURE_4    AKS Azure Monitor logging enabled
+#   CKV_AZURE_6    AKS API server authorized IP ranges (prod)
+#   CKV_AZURE_7    AKS network policy configured
+#   CKV_AZURE_116  AKS Azure Policy add-on enabled
+#   CKV_AZURE_117  AKS disk encryption / host encryption considered
+#   CKV_AZURE_137  ACR admin account disabled
+#   CKV_AZURE_139  ACR public network access
+#   CKV_AZURE_110  Key Vault purge protection enabled (staging/prod)
+#   CKV_AZURE_42   Key Vault soft delete enabled
+#   CKV_AZURE_44   Storage account minimum TLS 1.2
+#   CKV_AZURE_59   Storage account public access disabled
+#   CKV_AZURE_190  Storage account blob public access disabled
+# ---------------------------------------------------------------------------

@@ -1,0 +1,154 @@
+# ---------------------------------------------------------------------------
+# docs.yml
+#
+# Keeps every module README's inputs/outputs/providers table in lockstep with
+# the HCL. Hand-maintained Terraform documentation is wrong within two sprints;
+# generated documentation is wrong for exactly as long as it takes CI to run.
+#
+# terraform-docs injects its output between the
+#   <!-- BEGIN_TF_DOCS --> / <!-- END_TF_DOCS -->
+# markers in each modules/<name>/README.md, so the prose around the generated
+# block (architecture notes, usage examples, design rationale) is preserved.
+# ---------------------------------------------------------------------------
+name: Terraform Docs
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'modules/**'
+      - '.terraform-docs.yml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# contents: write       -> needed to push the regenerated README back onto the
+#                          PR branch (same-repo PRs only; see the fork note).
+# pull-requests: write  -> lets the action annotate the PR when docs are stale.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  terraform-docs:
+    name: Generate module documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Check out the PR *branch*, not the merge commit. The default
+          # refs/pull/N/merge ref is detached, so a commit made on top of it
+          # has nowhere to be pushed. Using head.ref gives a real branch.
+          # For fork PRs this resolves to the fork's branch name, which the
+          # push step below never runs against anyway.
+          ref: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          # The action needs to create a commit; a shallow clone is sufficient
+          # but we fetch a little history so the commit has a sane parent chain.
+          fetch-depth: 1
+          persist-credentials: true
+
+      # -------------------------------------------------------------------
+      # SAME-REPO PRs: regenerate and push the fix automatically.
+      #
+      # This is the pleasant path - the contributor never has to remember to
+      # run terraform-docs locally; CI just fixes the README and the PR picks
+      # the commit up.
+      # -------------------------------------------------------------------
+      - name: Render and commit docs (same-repo pull request)
+        if: github.event.pull_request.head.repo.fork != true
+        uses: terraform-docs/gh-actions@v1
+        with:
+          # find-dir walks `modules/` and renders every directory containing
+          # .tf files, so a newly added module is documented with zero config.
+          find-dir: modules
+          config-file: .terraform-docs.yml
+          output-file: README.md
+          # `inject` writes between the BEGIN/END markers and leaves everything
+          # else alone; `replace` would clobber the hand-written sections.
+          output-method: inject
+          git-push: true
+          git-commit-message: 'docs(modules): regenerate terraform-docs output'
+          fail-on-diff: false
+
+      # -------------------------------------------------------------------
+      # FORK PRs: verify only, never push.
+      #
+      # CAVEAT (the reason this workflow has two paths):
+      # `git-push: true` requires `contents: write`, but GitHub deliberately
+      # issues a READ-ONLY GITHUB_TOKEN for pull_request events originating
+      # from a fork - otherwise any stranger could get write access to this
+      # repository just by opening a PR. The push would therefore fail with a
+      # 403, and the whole check would go red for a reason the contributor
+      # cannot fix.
+      #
+      # (The usual workaround - `pull_request_target` - is worse: it runs the
+      # workflow with a privileged token against untrusted code. Not doing it.)
+      #
+      # So for forks we flip to `fail-on-diff: true`: the job renders the docs
+      # into a scratch checkout, compares, and fails with a clear instruction
+      # if they are stale. The contributor runs terraform-docs locally and
+      # pushes the result themselves.
+      # -------------------------------------------------------------------
+      - name: Verify docs are up to date (fork pull request)
+        if: github.event.pull_request.head.repo.fork == true
+        uses: terraform-docs/gh-actions@v1
+        with:
+          find-dir: modules
+          config-file: .terraform-docs.yml
+          output-file: README.md
+          output-method: inject
+          # Never attempt a push from a fork - the token cannot do it.
+          git-push: false
+          # Turn "docs are stale" into a hard, actionable failure instead.
+          fail-on-diff: true
+
+      - name: Explain the fork failure mode
+        if: failure() && github.event.pull_request.head.repo.fork == true
+        run: |
+          {
+            echo "## Module documentation is out of date"
+            echo ""
+            echo "This pull request comes from a fork, so CI cannot push the regenerated"
+            echo "README files back to your branch (GitHub issues a read-only token to"
+            echo "fork-originated workflows by design)."
+            echo ""
+            echo "Please regenerate locally and push the result:"
+            echo ""
+            echo '```bash'
+            echo 'terraform-docs --config .terraform-docs.yml markdown table \'
+            echo '  --output-file README.md --output-mode inject --recursive \'
+            echo '  --recursive-path . modules'
+            echo '```'
+            echo ""
+            echo "Or with Docker, no local install required:"
+            echo ""
+            echo '```bash'
+            echo 'docker run --rm -v "$PWD:/data" quay.io/terraform-docs/terraform-docs:0.19.0 \'
+            echo '  --config /data/.terraform-docs.yml markdown table \'
+            echo '  --output-file README.md --output-mode inject \'
+            echo '  --recursive --recursive-path /data /data/modules'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "## Module documentation"
+            echo ""
+            if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+              echo "✅ Generated docs match the committed READMEs (fork PR - verify-only mode)."
+            else
+              echo "✅ Module READMEs regenerated and pushed if they had drifted from the HCL."
+            fi
+            echo ""
+            echo "Generated content lives between the \`BEGIN_TF_DOCS\` / \`END_TF_DOCS\` markers;"
+            echo "everything outside them is hand-written and preserved."
+          } >> "$GITHUB_STEP_SUMMARY"

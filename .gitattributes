@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------------------
+# Line endings
+# ---------------------------------------------------------------------------
+# This repository is authored on Windows 11 but its CI runs on ubuntu-latest.
+# Without the rules below, Git's core.autocrlf would check out shell scripts
+# with CRLF endings, and a Linux runner would then fail with the classic:
+#
+#   /usr/bin/env: 'bash\r': No such file or directory
+#
+# Normalising text in the index and forcing LF on anything a POSIX shell
+# executes removes that entire failure class.
+
+# Default: normalise all text files to LF in the repository.
+* text=auto eol=lf
+
+# Must be LF -- these are executed by a shell on Linux runners.
+*.sh            text eol=lf
+Makefile        text eol=lf
+*.rego          text eol=lf
+.husky/*        text eol=lf
+
+# Must be CRLF -- Windows-native tooling.
+*.ps1           text eol=crlf
+*.psm1          text eol=crlf
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+
+# Terraform, YAML, JSON and Markdown: LF everywhere so `terraform fmt -check`
+# produces identical results on every platform.
+*.tf            text eol=lf
+*.tfvars        text eol=lf
+*.hcl           text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+
+# Binary -- never normalise, never diff as text.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary
+*.zip           binary
+*.gz            binary
+
+# ---------------------------------------------------------------------------
+# Linguist (GitHub language statistics)
+# ---------------------------------------------------------------------------
+# Keep the repository's language badge honest: it is a Terraform project, so
+# vendored docs and generated content should not skew the breakdown.
+docs/**         linguist-documentation
+*.md            linguist-documentation
+.github/**      linguist-generated=false
+
+# ---------------------------------------------------------------------------
+# Diff behaviour
+# ---------------------------------------------------------------------------
+# Lock files are generated; collapse them in pull request diffs so reviewers
+# focus on the configuration change rather than 200 lines of hashes.
+.terraform.lock.hcl linguist-generated=true

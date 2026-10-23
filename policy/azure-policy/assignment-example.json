@@ -1,0 +1,55 @@
+{
+  "type": "Microsoft.Authorization/policyAssignments",
+  "apiVersion": "2024-04-01",
+  "name": "afk-prod-require-platform-tags",
+  "location": "westeurope",
+  "identity": {
+    "type": "SystemAssigned"
+  },
+  "properties": {
+    "displayName": "afk :: require platform tag set (prod)",
+    "description": "Assigns the custom 'Require the platform tag set on all indexed resources' definition to the production subscription with the Deny effect. Assigned here at subscription scope purely to keep the example self-contained; the production pattern is a management-group assignment so that every current and future subscription under the Platform management group inherits it automatically. See policy/README.md.",
+    "policyDefinitionId": "/providers/Microsoft.Management/managementGroups/00000000-0000-0000-0000-000000000000/providers/Microsoft.Authorization/policyDefinitions/afk-require-platform-tags",
+    "scope": "/subscriptions/00000000-0000-0000-0000-000000000000",
+    "notScopes": [
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/NetworkWatcherRG",
+      "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/AzureBackupRG_westeurope_1"
+    ],
+    "enforcementMode": "Default",
+    "parameters": {
+      "tagNames": {
+        "value": [
+          "environment",
+          "project",
+          "owner",
+          "managed_by",
+          "cost_center"
+        ]
+      },
+      "effect": {
+        "value": "Deny"
+      },
+      "excludedResourceTypes": {
+        "value": [
+          "Microsoft.ContainerService/managedClusters/agentPools",
+          "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+          "Microsoft.Network/networkInterfaces",
+          "Microsoft.Resources/deployments",
+          "Microsoft.Resources/deploymentScripts"
+        ]
+      }
+    },
+    "nonComplianceMessages": [
+      {
+        "message": "This resource is missing one or more required platform tags. Every resource must carry environment, project, owner, managed_by and cost_center. If you are deploying with Terraform, pass tags = local.common_tags from the environment root module; see https://github.com/fakhfakhahmed/terraform-azure-aks-platform/blob/main/policy/README.md"
+      }
+    ],
+    "metadata": {
+      "assignedBy": "platform-engineering",
+      "owner": "ahmed.fakhfakh",
+      "project": "terraform-azure-aks-platform",
+      "environment": "prod",
+      "exemptionProcess": "Raise a PR adding an Azure Policy exemption resource under envs/prod/governance.tf with a written justification and an expiry date. Permanent, unjustified exemptions are not accepted."
+    }
+  }
+}

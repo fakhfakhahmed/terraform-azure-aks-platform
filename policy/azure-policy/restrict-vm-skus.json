@@ -1,0 +1,100 @@
+{
+  "name": "afk-restrict-compute-skus",
+  "type": "Microsoft.Authorization/policyDefinitions",
+  "properties": {
+    "displayName": "Restrict virtual machine and AKS node pool SKUs to an approved list",
+    "description": "Denies virtual machines, virtual machine scale sets and AKS agent pool profiles that request a VM size outside the approved list. This is a cost-control and capacity-planning guardrail as much as a security one: it stops a typo or a copy-pasted sample from provisioning a GPU or an M-series node, and it keeps the platform on SKU families that have reserved-instance coverage and regional quota. The AKS clause uses the agentPoolProfiles[*] array alias, so every pool in the cluster - the default pool and every user pool - is evaluated individually.",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "metadata": {
+      "version": "1.0.0",
+      "category": "Compute",
+      "source": "https://github.com/fakhfakhahmed/terraform-azure-aks-platform",
+      "owner": "platform-engineering"
+    },
+    "parameters": {
+      "listOfAllowedSKUs": {
+        "type": "Array",
+        "metadata": {
+          "displayName": "Allowed VM SKUs",
+          "description": "The VM sizes a workload is permitted to request. Keep this aligned with the SKU families that have reserved-instance coverage and regional quota in the target region.",
+          "strongType": "VMSKUs"
+        },
+        "defaultValue": [
+          "Standard_D2ds_v5",
+          "Standard_D4ds_v5",
+          "Standard_D8ds_v5",
+          "Standard_D16ds_v5",
+          "Standard_E4ds_v5",
+          "Standard_E8ds_v5",
+          "Standard_B2ms",
+          "Standard_B4ms"
+        ]
+      },
+      "effect": {
+        "type": "String",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Deny blocks non-compliant deployments. Audit reports them without blocking - use Audit for a soft-launch window before flipping to Deny."
+        },
+        "allowedValues": [
+          "Audit",
+          "Deny",
+          "Disabled"
+        ],
+        "defaultValue": "Deny"
+      }
+    },
+    "policyRule": {
+      "if": {
+        "anyOf": [
+          {
+            "allOf": [
+              {
+                "field": "type",
+                "equals": "Microsoft.Compute/virtualMachines"
+              },
+              {
+                "field": "Microsoft.Compute/virtualMachines/sku.name",
+                "notIn": "[parameters('listOfAllowedSKUs')]"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "field": "type",
+                "equals": "Microsoft.Compute/virtualMachineScaleSets"
+              },
+              {
+                "field": "Microsoft.Compute/virtualMachineScaleSets/sku.name",
+                "notIn": "[parameters('listOfAllowedSKUs')]"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "field": "type",
+                "equals": "Microsoft.ContainerService/managedClusters"
+              },
+              {
+                "count": {
+                  "field": "Microsoft.ContainerService/managedClusters/agentPoolProfiles[*]",
+                  "where": {
+                    "field": "Microsoft.ContainerService/managedClusters/agentPoolProfiles[*].vmSize",
+                    "notIn": "[parameters('listOfAllowedSKUs')]"
+                  }
+                },
+                "greater": 0
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

@@ -1,0 +1,122 @@
+# =============================================================================
+# bootstrap/terraform.tfvars.example
+# =============================================================================
+# Copy to terraform.tfvars and fill in the two GUIDs. terraform.tfvars is
+# gitignored; this .example file is committed.
+#
+#   cp terraform.tfvars.example terraform.tfvars      # bash
+#   Copy-Item terraform.tfvars.example terraform.tfvars   # PowerShell
+#
+# Find your values with:
+#   az account show --query "{subscription:id, tenant:tenantId, name:name}" -o table
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# REQUIRED -- Azure context
+# -----------------------------------------------------------------------------
+# azurerm v4 no longer infers the subscription from the Azure CLI context, so
+# this must be explicit. The values below are placeholders and WILL NOT WORK.
+
+subscription_id = "00000000-0000-0000-0000-000000000000"
+tenant_id       = "00000000-0000-0000-0000-000000000000"
+
+# -----------------------------------------------------------------------------
+# Region
+# -----------------------------------------------------------------------------
+# Where the state backend lives. This does not have to match the region your
+# workloads run in, and arguably should not -- state you cannot read during a
+# regional outage is state you cannot use to fix the outage.
+
+location = "westeurope"
+
+# -----------------------------------------------------------------------------
+# Naming
+# -----------------------------------------------------------------------------
+# Kept short: storage account names are capped at 24 characters and must be
+# globally unique across all of Azure. A 6-character random suffix is appended
+# automatically.
+
+prefix                    = "afk"
+state_resource_group_name = "rg-terraform-state"
+state_container_name      = "tfstate"
+
+# -----------------------------------------------------------------------------
+# Storage hardening
+# -----------------------------------------------------------------------------
+
+# LRS is the cheapest and is fine for a personal subscription. Use GRS or GZRS
+# if a regional outage blocking all deployments is unacceptable.
+state_account_replication_type = "GRS"
+
+# How long a deleted state blob (or blob version) stays recoverable. This is
+# the primary "someone deleted the state file" recovery mechanism.
+blob_soft_delete_retention_days = 30
+
+# false = shared access keys are unusable; the only way in is Entra ID + RBAC.
+# Leave this false. See the variable description for why it matters so much
+# for a container holding plaintext secrets.
+shared_access_key_enabled = false
+
+# GitHub-hosted runners egress from a large, changing IP range that cannot be
+# practically allow-listed, so the account stays publicly reachable with
+# key access disabled and RBAC scoped to two principals. Set to false only if
+# you run self-hosted runners inside a VNet with a private endpoint.
+state_account_public_network_access_enabled = true
+
+# Optional public IP allow-list. Leave empty to apply no IP restriction.
+# Azure storage firewalls reject /31 and /32 suffixes -- use a bare address.
+#   allowed_state_access_ip_rules = ["203.0.113.42", "198.51.100.0/24"]
+allowed_state_access_ip_rules = []
+
+# CanNotDelete lock on the state resource group. Must be removed by hand
+# before the bootstrap stack can be destroyed -- that friction is deliberate.
+enable_state_resource_lock = true
+
+# Route blob read/write/delete events to a Log Analytics workspace. OFF by
+# default so that cloning this repo and bootstrapping does not create a
+# recurring ingestion bill. Turn it ON in any real tenant.
+enable_state_audit_logging = false
+
+# -----------------------------------------------------------------------------
+# GitHub OIDC federated identity
+# -----------------------------------------------------------------------------
+# These build the federated credential SUBJECT strings, which Entra matches
+# exactly and case-sensitively. A mismatch here is the number one cause of
+# AADSTS70021 "No matching federated identity record found".
+
+github_org            = "fakhfakhahmed"
+github_repository     = "terraform-azure-aks-platform"
+github_default_branch = "main"
+github_environments   = ["dev", "staging", "prod"]
+
+# Create a credential for the "pull_request" entity so PR workflows can run
+# terraform plan against live state. Fork PRs never receive this subject.
+create_pull_request_credential = true
+
+# -----------------------------------------------------------------------------
+# CI permissions
+# -----------------------------------------------------------------------------
+# "subscription" is required because each environment creates its own resource
+# group. Switch to "resource_group" plus scoped_resource_group_names once those
+# resource groups exist and you want to tighten the blast radius.
+
+role_assignment_scope = "subscription"
+# scoped_resource_group_names = ["rg-afk-dev-weu-platform", "rg-afk-staging-weu-platform"]
+
+# Required because this platform creates role assignments (AcrPull for the
+# kubelet identity, Key Vault Secrets User for workload identities). Note that
+# User Access Administrator can escalate itself to Owner -- read the variable
+# description for how to scope it down with an ABAC condition.
+grant_user_access_administrator = true
+
+# -----------------------------------------------------------------------------
+# Tagging
+# -----------------------------------------------------------------------------
+
+owner       = "ahmed.fakhfakh"
+cost_center = "platform-engineering"
+
+additional_tags = {
+  # provisioned_by = "bootstrap"
+  # ticket         = "PLAT-001"
+}

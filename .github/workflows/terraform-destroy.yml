@@ -1,0 +1,237 @@
+# ---------------------------------------------------------------------------
+# terraform-destroy.yml
+#
+# Teardown for non-production environments. This exists for one reason: a
+# portfolio/lab subscription should not quietly bill for an idle AKS cluster
+# all month. Spin dev up, demo it, tear it down.
+#
+# ######################################################################
+# #  DESTRUCTIVE WORKFLOW - FOUR INDEPENDENT SAFETY LAYERS             #
+# #                                                                    #
+# #   1. workflow_dispatch ONLY. There is no push, schedule or PR       #
+# #      trigger. Nothing a merge does can ever reach this file.        #
+# #   2. A typed confirmation. The operator must type the environment   #
+# #      name exactly; a mis-click on the "Run workflow" button is not  #
+# #      sufficient intent to delete infrastructure.                    #
+# #   3. prod is refused outright by the guard job (see below).         #
+# #   4. GitHub Environment protection rules - the destroy job declares  #
+# #      `environment:`, so a required reviewer must still approve      #
+# #      after the guard passes.                                        #
+# #                                                                    #
+# #  Layers 1-3 are in this file and cannot be bypassed without a PR    #
+# #  (CODEOWNERS covers .github/workflows). Layer 4 must be configured   #
+# #  by the repository owner under Settings -> Environments.            #
+# ######################################################################
+# ---------------------------------------------------------------------------
+name: Terraform Destroy
+
+on:
+  # Manual only. Adding any automatic trigger to this workflow is a
+  # review-blocking change - see .github/CODEOWNERS.
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+          - staging
+          - prod
+      confirm:
+        description: 'Type the environment name EXACTLY to confirm (e.g. "dev")'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+# Shares the apply workflow's concurrency group, keyed on the state file.
+# An apply and a destroy racing against the same backend key would deadlock on
+# the state blob lease at best, and interleave create/delete operations at
+# worst. Queue them; never cancel one mid-flight (see terraform-apply.yml for
+# why cancelling a running apply/destroy corrupts state).
+concurrency:
+  group: terraform-state-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: '1.9.8'
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Job 1 - refuse obviously-wrong requests before any credential is minted.
+  # Runs with no Azure access at all, so a failure here is completely inert.
+  # -------------------------------------------------------------------------
+  guard:
+    name: Confirm destroy intent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify typed confirmation and target
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+          CONFIRMATION: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+
+          # ---- Layer 3: production is not destroyable from CI. ----
+          #
+          # Deliberately NOT "prod requires an extra approval". Production
+          # teardown is a break-glass operation: it should be performed by a
+          # named engineer, from a workstation, with a current state backup, an
+          # understood blast radius and a rollback plan - not by clicking a
+          # green button in a browser tab.
+          #
+          # Making the unsafe path *impossible* here rather than merely
+          # *inconvenient* means the only way to destroy prod is to open a PR
+          # that edits this guard, which CODEOWNERS routes to a human reviewer.
+          # That PR is the change-control record.
+          if [ "${TARGET_ENV}" = "prod" ]; then
+            echo "::error title=Production destroy refused::Production teardown is a deliberate manual break-glass operation, not a button. Run it locally with a reviewed plan, or raise a PR to amend this guard."
+            exit 1
+          fi
+
+          # ---- Layer 2: typed confirmation must match exactly. ----
+          # String comparison is case-sensitive and whitespace-sensitive on
+          # purpose: "Dev" or "dev " means the operator was not paying
+          # attention, and that is precisely when we want to stop.
+          if [ "${CONFIRMATION}" != "${TARGET_ENV}" ]; then
+            echo "::error title=Confirmation mismatch::Confirmation input did not match the selected environment. Expected the literal string '${TARGET_ENV}'."
+            exit 1
+          fi
+
+          echo "Destroy intent confirmed for environment '${TARGET_ENV}'."
+          {
+            echo "## Destroy request accepted by guard"
+            echo ""
+            echo "- Environment: \`${TARGET_ENV}\`"
+            echo "- Requested by: @${GITHUB_ACTOR}"
+            echo ""
+            echo "> Awaiting GitHub Environment approval before anything is deleted."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Job 2 - the destroy. Still blocked on Environment approval (layer 4).
+  # -------------------------------------------------------------------------
+  destroy:
+    name: Destroy (${{ inputs.environment }})
+    needs: guard
+    runs-on: ubuntu-latest
+    # >>> APPROVAL GATE <<<
+    # Even after the guard passes, GitHub holds this job until the Environment's
+    # required reviewers approve. Guard = "is this request coherent?";
+    # Environment = "does a human agree it should happen now?".
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: envs/${{ inputs.environment }}
+    env:
+      ARM_USE_OIDC: 'true'
+      ARM_USE_AZUREAD: 'true'
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TARGET_ENV: ${{ inputs.environment }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC federated credential, no secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init (partial backend config)
+        run: |
+          terraform init \
+            -input=false \
+            -lock-timeout=5m \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ inputs.environment }}/terraform.tfstate"
+
+      - name: Terraform plan -destroy
+        id: destroy-plan
+        # Plan first, save to a file, then apply that file. Same reasoning as
+        # the apply workflow: `terraform destroy -auto-approve` re-plans and
+        # deletes whatever it finds at that instant, whereas applying a saved
+        # destroy plan deletes exactly the set of resources enumerated below -
+        # and any resource protected by `lifecycle { prevent_destroy = true }`
+        # fails the plan here, before a single delete is issued.
+        run: |
+          terraform plan \
+            -destroy \
+            -input=false \
+            -lock-timeout=5m \
+            -no-color \
+            -out=tfdestroy
+
+      - name: Show what will be destroyed
+        run: |
+          set -euo pipefail
+          terraform show -no-color tfdestroy | tee destroy-plan.txt > /dev/null
+
+          # Count the deletions so the log carries an unmistakable blast-radius
+          # figure right before the destroy runs.
+          deletions="$(terraform show -json tfdestroy \
+            | jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length')"
+
+          echo "::warning title=Destroy blast radius::${deletions} resource(s) will be DELETED from environment '${TARGET_ENV}'."
+
+          {
+            echo "## Destroy plan - \`${TARGET_ENV}\`"
+            echo ""
+            echo "**${deletions} resource(s) will be deleted.**"
+            echo ""
+            echo "<details><summary>Show destroy plan</summary>"
+            echo ""
+            echo '```terraform'
+            head -c 60000 destroy-plan.txt
+            echo ""
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply (destroy plan)
+        id: destroy
+        run: |
+          terraform apply \
+            -input=false \
+            -lock-timeout=5m \
+            tfdestroy
+
+      - name: Record destroy result
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "### Result"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Environment | \`${TARGET_ENV}\` |"
+            echo "| State key | \`${TARGET_ENV}/terraform.tfstate\` |"
+            echo "| Destroyed by | @${GITHUB_ACTOR} |"
+            echo "| Outcome | \`${{ steps.destroy.outcome }}\` |"
+            echo ""
+            echo "> The state file itself is retained (now empty of managed resources)."
+            echo "> Re-run \`terraform-apply.yml\` for this environment to rebuild it from code."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Scrub local plan files
+        if: always()
+        run: rm -f tfdestroy destroy-plan.txt

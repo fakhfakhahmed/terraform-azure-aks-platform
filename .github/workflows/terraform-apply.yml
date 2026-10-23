@@ -1,0 +1,292 @@
+# ---------------------------------------------------------------------------
+# terraform-apply.yml
+#
+# The ONLY workflow in this repository that creates or mutates Azure
+# infrastructure (terraform-destroy.yml is the only one that removes it).
+#
+# ######################################################################
+# #  COST SAFETY - READ BEFORE ENABLING THIS WORKFLOW                  #
+# #                                                                    #
+# #  This workflow spends real money. AKS node pools, Application      #
+# #  Gateways, Premium ACR and Log Analytics ingestion are all billed  #
+# #  by the hour or by the GB.                                        #
+# #                                                                    #
+# #  The apply job declares `environment:`. GitHub will NOT start that #
+# #  job until the matching repository Environment's protection rules  #
+# #  are satisfied. THIS IS THE ONLY THING STANDING BETWEEN A MERGE    #
+# #  AND AN AZURE BILL.                                                #
+# #                                                                    #
+# #  The repository owner MUST configure, under                        #
+# #  Settings -> Environments, for each of `dev`, `staging`, `prod`:   #
+# #                                                                    #
+# #    1. Required reviewers  -> at least one human (yourself counts). #
+# #       Without this, the "gate" is decorative and every push to     #
+# #       main applies straight to Azure.                              #
+# #    2. Deployment branches -> restrict to `main` only.              #
+# #    3. (prod) a wait timer, so an accidental approval can still be  #
+# #       cancelled before anything is created.                        #
+# #                                                                    #
+# #  An Environment with no protection rules auto-approves. If you fork #
+# #  this repo, configure the Environments FIRST.                      #
+# ######################################################################
+# ---------------------------------------------------------------------------
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'envs/**'
+      - 'modules/**'
+      - 'policy/**'
+      - '.github/workflows/terraform-apply.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment to apply'
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+          - staging
+          - prod
+
+# contents: read  -> checkout only; this workflow never writes to the repo.
+# id-token: write -> mint the OIDC token for azure/login and the azurerm backend.
+# No pull-requests / issues / packages scope: an apply has nothing to say to a PR.
+permissions:
+  contents: read
+  id-token: write
+
+# cancel-in-progress is deliberately FALSE.
+#
+# Cancelling a `terraform apply` mid-flight is genuinely dangerous:
+#   * Terraform may be halfway through creating a resource. The runner is
+#     killed, the state write never lands, and the resource exists in Azure
+#     while state believes it does not -> an orphan you pay for and cannot see.
+#   * The azurerm backend holds a blob lease on the state file. A SIGKILL
+#     leaves that lease dangling and the next run fails with "state blob is
+#     already locked", requiring a manual `terraform force-unlock`.
+# Queuing the second run behind the first is slower but always correct.
+#
+# The group is keyed on the *state file*, not on the workflow, and the destroy
+# workflow uses the identical group name so apply and destroy can never race
+# each other against the same backend key.
+concurrency:
+  group: terraform-state-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: '1.9.8'
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Job 1 - cheap guard rail that runs before any Azure credential is minted.
+  # -------------------------------------------------------------------------
+  guard:
+    name: Validate apply request
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+    steps:
+      - name: Resolve and authorise the target environment
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # On a push event the `inputs` context is empty, so this falls back
+          # to dev - continuous delivery lands in dev automatically, and only
+          # in dev.
+          REQUESTED_ENV: ${{ inputs.environment || 'dev' }}
+        run: |
+          set -euo pipefail
+
+          case "${REQUESTED_ENV}" in
+            dev|staging|prod) ;;
+            *)
+              echo "::error title=Invalid environment::'${REQUESTED_ENV}' is not one of dev|staging|prod."
+              exit 1
+              ;;
+          esac
+
+          # HARD RULE: production is never applied by a merge.
+          #
+          # Automatic prod deployment on push would mean a single approved PR
+          # silently reshapes the production cluster the moment it merges, with
+          # no separate decision point and no opportunity to pick the moment.
+          # Production applies must be an explicit, timed, human-initiated act:
+          # workflow_dispatch, during a change window, by someone watching.
+          if [ "${EVENT_NAME}" = "push" ] && [ "${REQUESTED_ENV}" = "prod" ]; then
+            echo "::error title=Production apply blocked::Production can only be applied via workflow_dispatch, never from a push to main."
+            exit 1
+          fi
+
+          echo "environment=${REQUESTED_ENV}" >> "$GITHUB_OUTPUT"
+          echo "Apply authorised for environment '${REQUESTED_ENV}' (event: ${EVENT_NAME})."
+
+  # -------------------------------------------------------------------------
+  # Job 2 - the apply itself. Blocked on the Environment protection rule.
+  # -------------------------------------------------------------------------
+  apply:
+    name: Apply (${{ inputs.environment || 'dev' }})
+    needs: guard
+    runs-on: ubuntu-latest
+    # >>> THE COST GATE <<<
+    # This single line is what forces a human approval before Azure is touched.
+    # GitHub pauses the job here and notifies the configured reviewers. Removing
+    # it, or leaving the Environment without required reviewers, turns this
+    # repository into an unattended spending machine. See the banner at the top.
+    environment: ${{ inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: envs/${{ inputs.environment || 'dev' }}
+    env:
+      ARM_USE_OIDC: 'true'
+      ARM_USE_AZUREAD: 'true'
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TARGET_ENV: ${{ inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          # Same reasoning as terraform-plan.yml: we parse Terraform's output
+          # ourselves (into the job summary), and the wrapper rewrites it.
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC federated credential, no secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init (partial backend config)
+        run: |
+          terraform init \
+            -input=false \
+            -lock-timeout=5m \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ inputs.environment || 'dev' }}/terraform.tfstate"
+
+      - name: Terraform plan
+        id: plan
+        # DESIGN DECISION: the plan is regenerated here rather than downloading
+        # the artifact produced by terraform-plan.yml.
+        #
+        # Reusing the PR artifact would be:
+        #   + faster (no second refresh against ARM), and
+        #   + atomic - you apply byte-for-byte what the reviewer approved, so
+        #     nothing can drift between review and apply.
+        # But it requires guarantees this repo does not currently make:
+        #   - artifact integrity: an artifact is just a zip any workflow with
+        #     actions:write can overwrite; applying one is applying untrusted
+        #     input unless it is signed/attested;
+        #   - freshness: a plan goes stale, and a stale plan applied against
+        #     changed infrastructure fails late and messily;
+        #   - the plan is bound to a specific state serial, so any intervening
+        #     apply invalidates it anyway.
+        #
+        # Regenerating costs ~60s and the apply below consumes the saved plan
+        # file, so the apply is still atomic with respect to THIS run. If you
+        # later add artifact attestation (actions/attest-build-provenance),
+        # switching to artifact reuse becomes the better trade.
+        run: |
+          terraform plan \
+            -input=false \
+            -lock-timeout=5m \
+            -no-color \
+            -out=tfplan
+
+      - name: Terraform apply
+        id: apply
+        # Applying the SAVED PLAN FILE (not a bare `terraform apply`) is the
+        # important detail: -auto-approve is only safe because `tfplan` pins
+        # the exact set of actions computed moments ago. A bare auto-approved
+        # apply would re-plan and silently execute whatever it found.
+        run: |
+          terraform apply \
+            -input=false \
+            -lock-timeout=5m \
+            -auto-approve \
+            tfplan
+
+      - name: Collect outputs
+        id: outputs
+        run: terraform output -json > outputs.json
+
+      - name: Write deployment summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Terraform apply - \`${TARGET_ENV}\`"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Environment | \`${TARGET_ENV}\` |"
+            echo "| State key | \`${TARGET_ENV}/terraform.tfstate\` |"
+            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
+            echo "| Triggered by | @${GITHUB_ACTOR} |"
+            echo "| Event | \`${GITHUB_EVENT_NAME}\` |"
+            echo "| Apply result | \`${{ steps.apply.outcome }}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f outputs.json ]; then
+            {
+              echo "### Stack outputs"
+              echo ""
+              echo "| Output | Value |"
+              echo "| --- | --- |"
+              # Only non-sensitive outputs are rendered. Terraform flags
+              # sensitive outputs in the JSON, and the job summary is visible
+              # to anyone with read access to the repository - so a kubeconfig,
+              # a Key Vault URI with a SAS token or an admin password must
+              # never land here. Sensitive outputs are listed by NAME only.
+              jq -r '
+                to_entries
+                | map(select(.value.sensitive == false))
+                | if length == 0 then
+                    ["| _(no non-sensitive outputs)_ | |"]
+                  else
+                    map("| `\(.key)` | `\(.value.value | tostring)` |")
+                  end
+                | .[]
+              ' outputs.json
+              echo ""
+              echo "<sub>Sensitive outputs are redacted from this summary by design. "
+              echo "Retrieve them with <code>terraform output -raw &lt;name&gt;</code> from an authorised workstation.</sub>"
+              echo ""
+              echo "<details><summary>Sensitive outputs present (names only)</summary>"
+              echo ""
+              jq -r '
+                to_entries
+                | map(select(.value.sensitive == true) | "- `\(.key)`")
+                | if length == 0 then ["- _(none)_"] else . end
+                | .[]
+              ' outputs.json
+              echo ""
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No outputs file was produced - the apply did not complete._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Scrub local plan and output files
+        if: always()
+        # Defence in depth. The runner is ephemeral, but these files contain
+        # resource identifiers and possibly sensitive values; removing them
+        # guarantees nothing is picked up by a later step or a mis-scoped
+        # upload-artifact added in future.
+        run: rm -f tfplan outputs.json

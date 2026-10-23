@@ -1,0 +1,169 @@
+# ---------------------------------------------------------------------------
+# dependabot.yml
+#
+# Two things rot in a Terraform repo if nobody watches them:
+#   1. provider version constraints  - azurerm ships breaking-ish changes often,
+#      and a repo pinned to a two-year-old provider cannot express current AKS
+#      features (workload identity, node auto-provisioning, ...);
+#   2. GitHub Action versions        - an unmaintained action is a supply-chain
+#      liability, and action deprecations (node16 -> node20, upload-artifact v3
+#      sunset) break pipelines with no code change on our side.
+#
+# Dependabot handles both. Every PR it raises still goes through the full
+# terraform-plan.yml gate - fmt, validate, tflint, checkov, plan, conftest - so
+# an incompatible provider bump is caught before a human even looks at it.
+#
+# NOTE ON `directories` (plural): this key accepts a list, replacing what used
+# to be a dozen near-identical `directory:` blocks. One entry per *concern*
+# rather than one per folder keeps this file readable as the repo grows.
+# ---------------------------------------------------------------------------
+version: 2
+
+updates:
+  # -------------------------------------------------------------------------
+  # Root modules: the bootstrap stack and the three environments.
+  #
+  # These are where provider constraints and remote module versions are
+  # actually pinned, so this is the entry that produces most of the signal.
+  # -------------------------------------------------------------------------
+  - package-ecosystem: terraform
+    directories:
+      - '/bootstrap'
+      - '/envs/dev'
+      - '/envs/staging'
+      - '/envs/prod'
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Europe/Paris
+    # Grouped so one azurerm bump arrives as a single reviewable PR across all
+    # four root modules, instead of four PRs that must be merged in lockstep to
+    # keep .terraform.lock.hcl consistent between environments.
+    groups:
+      azure-providers:
+        patterns:
+          - 'azurerm'
+          - 'azuread'
+          - 'azapi'
+        update-types:
+          - minor
+          - patch
+      terraform-providers:
+        patterns:
+          - '*'
+        exclude-patterns:
+          - 'azurerm'
+          - 'azuread'
+          - 'azapi'
+        update-types:
+          - minor
+          - patch
+    # Low limit on purpose: an unreviewed queue of 20 infra PRs is not a
+    # security posture, it is a backlog. Keep it small enough to actually clear.
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(deps)'
+      include: scope
+    labels:
+      - dependencies
+      - terraform
+    reviewers:
+      - fakhfakhahmed
+    assignees:
+      - fakhfakhahmed
+    # Major provider upgrades are migrations, not dependency bumps: azurerm 4.x
+    # changed required provider configuration and renamed attributes. Those are
+    # planned deliberately with the upgrade guide open, not merged from a bot
+    # PR on a Monday morning. Minor/patch bumps remain fully automated above.
+    ignore:
+      - dependency-name: 'azurerm'
+        update-types:
+          - version-update:semver-major
+      - dependency-name: 'azuread'
+        update-types:
+          - version-update:semver-major
+
+  # -------------------------------------------------------------------------
+  # Reusable modules. Separated from the root modules because the blast radius
+  # is different: a change here affects every environment at once, so these
+  # PRs deserve their own label and their own review attention.
+  # -------------------------------------------------------------------------
+  - package-ecosystem: terraform
+    directories:
+      - '/modules/naming'
+      - '/modules/network'
+      - '/modules/acr'
+      - '/modules/aks'
+      - '/modules/identity'
+      - '/modules/keyvault'
+      - '/modules/observability'
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:30'
+      timezone: Europe/Paris
+    groups:
+      module-providers:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(deps)'
+      include: scope
+    labels:
+      - dependencies
+      - terraform
+      - modules
+    reviewers:
+      - fakhfakhahmed
+    assignees:
+      - fakhfakhahmed
+    ignore:
+      - dependency-name: 'azurerm'
+        update-types:
+          - version-update:semver-major
+
+  # -------------------------------------------------------------------------
+  # GitHub Actions. Scanned from '/', which covers everything under
+  # .github/workflows/.
+  # -------------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: '/'
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:00'
+      timezone: Europe/Paris
+    groups:
+      # One PR a week for all routine action bumps. Reviewing fifteen separate
+      # "bump actions/checkout from 4.1.7 to 4.2.0" PRs is busywork that trains
+      # you to rubber-stamp - exactly the habit you do not want when the next
+      # PR is a compromised action.
+      github-actions:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+      # Majors stay ungrouped and separate: they are the ones that change
+      # inputs, drop Node runtimes, or alter permission requirements.
+      github-actions-major:
+        patterns:
+          - '*'
+        update-types:
+          - major
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'ci(deps)'
+      include: scope
+    labels:
+      - dependencies
+      - github-actions
+    reviewers:
+      - fakhfakhahmed
+    assignees:
+      - fakhfakhahmed

@@ -1,0 +1,36 @@
+# =============================================================================
+# envs/dev/backend.hcl.example
+# =============================================================================
+# Template for envs/dev/backend.hcl, which you create locally after running
+# bootstrap/ once. backend.hcl itself is gitignored (see .gitignore's
+# "Backend configuration" section) -- every operator/clone generates their own
+# because the storage account name is random-suffixed by bootstrap and is
+# therefore different per bootstrap run. Only this .example file is committed.
+#
+# How to produce the real file:
+#   1. Preferred: .\scripts\bootstrap-backend.ps1 -WriteBackendFiles
+#      (reads the bootstrap outputs and writes envs/{dev,staging,prod}/backend.hcl
+#      for you)
+#   2. By hand: copy this file to backend.hcl in this directory and fill in
+#      the values from `terraform -chdir=bootstrap output`.
+#
+# Then run:  .\scripts\init-env.ps1 dev
+# =============================================================================
+
+resource_group_name  = "rg-terraform-state"
+# From `terraform -chdir=bootstrap output state_storage_account_name`, e.g.
+# "afktfstateweu123456" -- random-suffixed by bootstrap/main.tf, so this is
+# NOT guessable and NOT the same across two different bootstrap runs.
+storage_account_name = "<from bootstrap output, e.g. afktfstateweu123456>"
+container_name       = "tfstate"
+
+# One state file per environment in the shared container -- never share a key
+# between environments, or one environment's apply will silently overwrite
+# another's state.
+key = "dev/terraform.tfstate"
+
+# Required because bootstrap disables the storage account's shared access
+# keys (shared_access_key_enabled = false) -- see bootstrap/variables.tf.
+# Authentication is Entra ID + RBAC ("Storage Blob Data Contributor" on the
+# tfstate container), never an account key.
+use_azuread_auth = true

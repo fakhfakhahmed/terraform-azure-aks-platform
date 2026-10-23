@@ -1,0 +1,114 @@
+{
+  "name": "afk-deny-aks-insecure-cluster-profile",
+  "type": "Microsoft.Authorization/policyDefinitions",
+  "properties": {
+    "displayName": "AKS clusters must have private nodes, an OIDC issuer and no local accounts",
+    "description": "Denies AKS clusters that violate any of three baseline controls: (1) an agent pool that assigns public IPs to its nodes, which puts the kubelet and every hostNetwork pod directly on the internet behind nothing but an NSG; (2) a disabled OIDC issuer, without which Entra ID Workload Identity federation cannot function and workloads fall back to sharing the kubelet identity; (3) enabled local admin accounts, whose client certificate bypasses Entra ID entirely - no MFA, no conditional access, no per-user audit trail, and no revocation short of rotating the cluster CA. The three clauses are combined with anyOf so a cluster failing any one of them is non-compliant. This definition is the platform-side mirror of conftest rules 2, 3 and 9 in policy/conftest/terraform.rego: the conftest rules fail the pull request, this one stops the same change arriving through the portal, the CLI, or a pipeline outside this repository.",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "metadata": {
+      "version": "1.0.0",
+      "category": "Kubernetes",
+      "source": "https://github.com/fakhfakhahmed/terraform-azure-aks-platform",
+      "owner": "platform-engineering"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Deny blocks non-compliant cluster create/update calls. Audit records the compliance state only; use it to measure an existing estate before enforcing."
+        },
+        "allowedValues": [
+          "Audit",
+          "Deny",
+          "Disabled"
+        ],
+        "defaultValue": "Deny"
+      },
+      "requireOidcIssuer": {
+        "type": "Boolean",
+        "metadata": {
+          "displayName": "Require the OIDC issuer",
+          "description": "When true, a cluster with oidcIssuerProfile.enabled set to false (or absent) is non-compliant. Workload Identity federation is built on this issuer."
+        },
+        "defaultValue": true
+      },
+      "requireLocalAccountsDisabled": {
+        "type": "Boolean",
+        "metadata": {
+          "displayName": "Require local accounts to be disabled",
+          "description": "When true, a cluster with disableLocalAccounts set to false (or absent) is non-compliant. Set to false only for a sandbox management group, and record the justification in the assignment metadata."
+        },
+        "defaultValue": true
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.ContainerService/managedClusters"
+          },
+          {
+            "anyOf": [
+              {
+                "count": {
+                  "field": "Microsoft.ContainerService/managedClusters/agentPoolProfiles[*]",
+                  "where": {
+                    "field": "Microsoft.ContainerService/managedClusters/agentPoolProfiles[*].enableNodePublicIP",
+                    "equals": "true"
+                  }
+                },
+                "greater": 0
+              },
+              {
+                "allOf": [
+                  {
+                    "value": "[parameters('requireOidcIssuer')]",
+                    "equals": true
+                  },
+                  {
+                    "anyOf": [
+                      {
+                        "field": "Microsoft.ContainerService/managedClusters/oidcIssuerProfile.enabled",
+                        "exists": "false"
+                      },
+                      {
+                        "field": "Microsoft.ContainerService/managedClusters/oidcIssuerProfile.enabled",
+                        "notEquals": "true"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "allOf": [
+                  {
+                    "value": "[parameters('requireLocalAccountsDisabled')]",
+                    "equals": true
+                  },
+                  {
+                    "anyOf": [
+                      {
+                        "field": "Microsoft.ContainerService/managedClusters/disableLocalAccounts",
+                        "exists": "false"
+                      },
+                      {
+                        "field": "Microsoft.ContainerService/managedClusters/disableLocalAccounts",
+                        "notEquals": "true"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

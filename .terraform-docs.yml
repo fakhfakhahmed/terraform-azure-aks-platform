@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# terraform-docs configuration
+# ---------------------------------------------------------------------------
+# Module README files are GENERATED from this config by `make docs` and by the
+# .github/workflows/docs.yml pipeline. Hand-written prose lives OUTSIDE the
+# injection markers and is preserved across regeneration:
+#
+#   <!-- BEGIN_TF_DOCS -->   ... generated, do not edit by hand ...   <!-- END_TF_DOCS -->
+#
+# Rationale: input/output tables rot the moment someone adds a variable.
+# Generating them makes the documentation a build artefact with a CI gate,
+# which is the only way module docs stay true at scale.
+#
+# Usage:
+#   terraform-docs --config .terraform-docs.yml modules/aks
+#   terraform-docs --config .terraform-docs.yml --recursive --recursive-path . modules
+# ---------------------------------------------------------------------------
+
+formatter: markdown table
+
+version: ">= 0.17.0"
+
+# Write into each module's README.md, injecting between the markers rather
+# than replacing the file, so curated prose (examples, design notes, gotchas)
+# survives regeneration.
+output:
+  file: README.md
+  mode: inject
+  template: |-
+    <!-- BEGIN_TF_DOCS -->
+    {{ .Content }}
+    <!-- END_TF_DOCS -->
+
+output-values:
+  enabled: false
+
+sort:
+  enabled: true
+  # `required` puts mandatory inputs first, which is what a consumer of the
+  # module needs to see before anything else.
+  by: required
+
+settings:
+  anchor: true
+  color: true
+  default: true
+  description: true
+  escape: true
+  hide-empty: true
+  html: true
+  indent: 2
+  lockfile: false
+  read-comments: true
+  required: true
+  sensitive: true
+  type: true
+
+sections:
+  show:
+    - header
+    - requirements
+    - providers
+    - modules
+    - resources
+    - inputs
+    - outputs
+
+content: |-
+  {{ .Header }}
+
+  ## Requirements
+
+  {{ .Requirements }}
+
+  ## Providers
+
+  {{ .Providers }}
+
+  ## Modules
+
+  {{ .Modules }}
+
+  ## Resources
+
+  {{ .Resources }}
+
+  ## Inputs
+
+  {{ .Inputs }}
+
+  ## Outputs
+
+  {{ .Outputs }}
+
+# Recurse into every directory under the given path so `modules/*` are all
+# documented in one invocation.
+recursive:
+  enabled: true
+  path: modules
+  include-main: false

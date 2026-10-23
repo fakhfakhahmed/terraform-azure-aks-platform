@@ -1,0 +1,139 @@
+# ---------------------------------------------------------------------------
+# Terraform
+# ---------------------------------------------------------------------------
+
+# Local provider plugin cache and module cache. Machine-specific, large,
+# and fully reproducible from `terraform init`. Never commit.
+**/.terraform/*
+**/.terraform
+
+# State files. These are the single most dangerous thing you can commit:
+# Terraform state stores every attribute of every resource IN PLAINTEXT,
+# including generated passwords, connection strings, certificates and keys.
+# State belongs in the remote backend (Azure Storage, RBAC-restricted), not git.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Crash logs produced when Terraform or a provider panics.
+crash.log
+crash.*.log
+
+# ---------------------------------------------------------------------------
+# Variable files
+# ---------------------------------------------------------------------------
+# *.tfvars commonly hold environment-specific values and occasionally secrets.
+# We ignore them by default and whitelist the ones that are deliberately
+# committed:
+#   - envs/*/terraform.tfvars  -> checked in on purpose; they contain only
+#     non-sensitive environment shape (node counts, SKUs, CIDRs). Secrets are
+#     never placed there; they come from Key Vault or OIDC-issued tokens.
+#   - *.auto.tfvars.example / *.tfvars.example -> templates for humans.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.auto.tfvars.example
+!envs/*/terraform.tfvars
+
+# ---------------------------------------------------------------------------
+# Backend configuration
+# ---------------------------------------------------------------------------
+# backend.hcl holds the storage account / resource group names of the state
+# backend. Not strictly secret, but environment-specific and bootstrap-derived,
+# so each operator generates their own. The .example file is committed.
+backend.hcl
+*.backend.hcl
+!backend.hcl.example
+
+# ---------------------------------------------------------------------------
+# Plan artefacts
+# ---------------------------------------------------------------------------
+# A saved plan file is a serialised copy of the state delta and CAN contain
+# sensitive values. Treat it like state: never commit, short retention in CI.
+*.tfplan
+tfplan
+tfplan.json
+tfdestroy
+plan.txt
+plan.out
+
+# ---------------------------------------------------------------------------
+# Terraform lock files -- NOT IGNORED, DELIBERATELY COMMITTED
+# ---------------------------------------------------------------------------
+# .terraform.lock.hcl records the exact provider versions AND their checksums
+# for each platform. Committing it is the Terraform equivalent of committing
+# package-lock.json:
+#   1. Reproducibility   - every developer and every CI run resolves the exact
+#                          same provider builds, so "works on my machine" and
+#                          surprise provider upgrades disappear.
+#   2. Supply-chain      - the recorded H1 hashes are verified on `init`,
+#                          so a tampered or substituted provider binary fails.
+#   3. Reviewable        - a provider bump becomes an explicit, diffable change
+#                          in a pull request instead of an invisible event.
+# Regenerate for all CI platforms with:
+#   terraform providers lock -platform=windows_amd64 -platform=linux_amd64 -platform=darwin_arm64
+# (Do NOT add .terraform.lock.hcl below. The absence of an ignore rule is the point.)
+
+# Terraform CLI config / credentials -- these DO contain tokens.
+.terraformrc
+terraform.rc
+.terraform.d/
+
+# ---------------------------------------------------------------------------
+# Cloud / tooling credentials
+# ---------------------------------------------------------------------------
+.azure/
+azureProfile.json
+*.pem
+*.key
+*.pfx
+*.p12
+!**/testdata/**/*.pem
+credentials.json
+sp.json
+.env
+.env.*
+!.env.example
+
+# Kubeconfigs contain cluster credentials.
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+.kube/
+
+# ---------------------------------------------------------------------------
+# Tooling output
+# ---------------------------------------------------------------------------
+.infracost/
+infracost.json
+infracost-base.json
+checkov-report.*
+results.sarif
+*.sarif
+.tflint.d/
+tflint-report.*
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ---------------------------------------------------------------------------
+# Scratch
+# ---------------------------------------------------------------------------
+scratch/
+tmp/
+*.bak
+*.orig
+*.log
+!docs/**/*.log

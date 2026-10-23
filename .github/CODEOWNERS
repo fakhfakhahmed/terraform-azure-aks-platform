@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# CODEOWNERS - terraform-azure-aks-platform
+#
+# CODEOWNERS on its own is only a *suggestion*: it auto-requests a review from
+# the listed owners and nothing more. The teeth come from pairing it with
+# branch protection on `main`:
+#
+#     Settings -> Branches -> Branch protection rule for `main`
+#       [x] Require a pull request before merging
+#       [x] Require approvals (>= 1)
+#       [x] Require review from Code Owners     <-- this is the enforcement
+#       [x] Dismiss stale approvals when new commits are pushed
+#       [x] Require status checks: terraform-plan / detect-changes, security
+#       [x] Do not allow bypassing the above settings
+#
+# With "Require review from Code Owners" enabled, a PR that touches any path
+# below cannot merge until the matching owner approves. That is what turns the
+# sensitive-path rules further down from documentation into a control.
+#
+# Matching rules: last match wins, so ordering is significant - the catch-all
+# comes first and progressively narrower, more sensitive paths follow.
+# ---------------------------------------------------------------------------
+
+# Default owner for everything in the repository.
+*                           @fakhfakhahmed
+
+# ---------------------------------------------------------------------------
+# Production environment.
+# Changes here bill real money and affect the cluster that serves traffic.
+# Nothing merges into envs/prod/ without an explicit owner approval, and the
+# apply is additionally gated by the `prod` GitHub Environment's required
+# reviewers (see .github/workflows/terraform-apply.yml).
+# ---------------------------------------------------------------------------
+/envs/prod/                 @fakhfakhahmed
+
+# ---------------------------------------------------------------------------
+# Policy-as-code.
+# These files ARE the guardrails. A PR that weakens an OPA rule or deletes an
+# Azure Policy definition is functionally a request to lower the security bar,
+# and must be reviewed as such rather than slipping through as "a .rego tweak".
+# ---------------------------------------------------------------------------
+/policy/                    @fakhfakhahmed
+
+# ---------------------------------------------------------------------------
+# CI/CD definitions.
+# The workflows hold the OIDC trust configuration, the environment approval
+# gates and the cost safety rails. Anyone who can edit a workflow can remove
+# the `environment:` key that forces manual approval before `terraform apply`,
+# or add a trigger to terraform-destroy.yml. Self-modifying CI is the classic
+# supply-chain escalation path - owner review is mandatory here.
+# ---------------------------------------------------------------------------
+/.github/workflows/         @fakhfakhahmed
+/.github/dependabot.yml     @fakhfakhahmed
+/.github/CODEOWNERS         @fakhfakhahmed
+
+# ---------------------------------------------------------------------------
+# Bootstrap stack.
+# Creates the remote state storage account, the Entra ID application and the
+# federated credential that every other workflow authenticates with. Breaking
+# this does not break one environment - it breaks the ability to manage any of
+# them, and recovery is a manual, credentialled operation.
+# ---------------------------------------------------------------------------
+/bootstrap/                 @fakhfakhahmed
+
+# ---------------------------------------------------------------------------
+# Security and linting configuration.
+# Relaxing a Checkov skip-list or a tflint rule changes what CI is willing to
+# let through. Reviewed alongside whatever change motivated the relaxation.
+# ---------------------------------------------------------------------------
+/.checkov.yml               @fakhfakhahmed
+/.tflint.hcl                @fakhfakhahmed

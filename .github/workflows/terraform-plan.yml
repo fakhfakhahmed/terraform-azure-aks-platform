@@ -1,0 +1,547 @@
+# ---------------------------------------------------------------------------
+# terraform-plan.yml
+#
+# Pull-request gate for the AKS platform. This workflow is intentionally
+# READ-ONLY against Azure: it never applies. Its job is to tell a reviewer,
+# before merge, exactly what would change and whether that change clears the
+# quality / security / policy bar.
+#
+# Pipeline shape:
+#   detect-changes  ->  plan (matrix over the affected environments)
+#
+# Why a change-detection job instead of always planning all three envs?
+#   * A plan performs a full refresh against Azure. Three refreshes per push
+#     is slow and burns ARM API quota for no reason when only envs/dev moved.
+#   * But a change under modules/** or policy/** can alter EVERY environment,
+#     so that case deliberately fans out to all three.
+#
+# COST SAFETY: there is no `terraform apply` anywhere in this file, and the
+# workflow requests no write access to Azure beyond what a plan needs. Applies
+# live in terraform-apply.yml and are gated behind GitHub Environment
+# protection rules with required reviewers.
+# ---------------------------------------------------------------------------
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches:
+      - main
+    # Path filters keep the ARM-touching workflow off doc-only PRs. Note the
+    # workflow file itself is included: if we change the pipeline, we want the
+    # pipeline to prove it still works on the same PR.
+    paths:
+      - 'envs/**'
+      - 'modules/**'
+      - 'policy/**'
+      - '.checkov.yml'
+      - '.tflint.hcl'
+      - '.github/workflows/terraform-plan.yml'
+  # Manual escape hatch: lets a maintainer re-run a plan for all environments
+  # (for example after rotating the OIDC federated credential) without pushing
+  # an empty commit.
+  workflow_dispatch:
+
+# Least privilege. Everything here is justified:
+#   contents: read        -> checkout
+#   id-token: write       -> mint the OIDC token consumed by azure/login
+#   pull-requests: write  -> create/update the sticky plan comment
+#   issues: write         -> PR comments are issue comments under the REST API
+# Deliberately NOT granted: security-events (no SARIF upload here; that lives
+# in security.yml), packages, actions:write, or contents:write.
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  issues: write
+
+# One in-flight plan per pull request. Cancelling a superseded plan is safe
+# because a plan takes no lock it cannot recover from and writes nothing.
+# (Contrast with terraform-apply.yml, which must NOT cancel in progress.)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: '1.9.8'
+  # Suppresses interactive prompts and the "Terraform has been successfully
+  # initialized" marketing banner, which keeps the PR comment readable.
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Job 1 - work out which environments this PR can possibly affect.
+  # -------------------------------------------------------------------------
+  detect-changes:
+    name: Detect affected environments
+    runs-on: ubuntu-latest
+    outputs:
+      # JSON array, e.g. ["dev","staging"] - consumed with fromJSON() below.
+      environments: ${{ steps.matrix.outputs.environments }}
+      has-changes: ${{ steps.matrix.outputs.has-changes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Classify changed paths
+        id: filter
+        # paths-filter needs a base ref to diff against, which only exists for
+        # pull_request events. On workflow_dispatch we skip it and fan out to
+        # every environment instead (see the next step).
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            shared:
+              - 'modules/**'
+              - 'policy/**'
+              - '.checkov.yml'
+              - '.tflint.hcl'
+              - '.terraform-docs.yml'
+              - '.github/workflows/terraform-plan.yml'
+            dev:
+              - 'envs/dev/**'
+            staging:
+              - 'envs/staging/**'
+            prod:
+              - 'envs/prod/**'
+
+      - name: Build environment matrix
+        id: matrix
+        env:
+          # Read filter results through env rather than interpolating them
+          # directly into the script body - that keeps untrusted-ish values out
+          # of the shell parse step on principle, even though these are booleans.
+          IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          SHARED_CHANGED: ${{ steps.filter.outputs.shared }}
+          DEV_CHANGED: ${{ steps.filter.outputs.dev }}
+          STAGING_CHANGED: ${{ steps.filter.outputs.staging }}
+          PROD_CHANGED: ${{ steps.filter.outputs.prod }}
+        run: |
+          set -euo pipefail
+
+          envs=()
+
+          # A manual run, or any change to shared code (modules, policy, lint
+          # config), can move every environment - so plan all of them.
+          if [ "${IS_DISPATCH}" = "true" ] || [ "${SHARED_CHANGED}" = "true" ]; then
+            envs=(dev staging prod)
+          else
+            # NOTE: deliberately using full `if` blocks rather than
+            # `[ ... ] && envs+=(x)`. Under `set -e` a false short-circuit
+            # returns non-zero and would kill the step.
+            if [ "${DEV_CHANGED}" = "true" ]; then envs+=(dev); fi
+            if [ "${STAGING_CHANGED}" = "true" ]; then envs+=(staging); fi
+            if [ "${PROD_CHANGED}" = "true" ]; then envs+=(prod); fi
+          fi
+
+          if [ "${#envs[@]}" -eq 0 ]; then
+            echo "No Terraform environment was affected by this change."
+            echo "environments=[]" >> "$GITHUB_OUTPUT"
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+          else
+            matrix_json="$(printf '%s\n' "${envs[@]}" | jq -R . | jq -c -s .)"
+            echo "Planning environments: ${matrix_json}"
+            echo "environments=${matrix_json}" >> "$GITHUB_OUTPUT"
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarise detection result
+        run: |
+          {
+            echo "## Terraform plan scope"
+            echo ""
+            if [ "${{ steps.matrix.outputs.has-changes }}" = "true" ]; then
+              echo "Environments planned: \`${{ steps.matrix.outputs.environments }}\`"
+            else
+              echo "No environment affected - plan jobs skipped."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Job 2 - plan each affected environment.
+  # -------------------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.environment }})
+    needs: detect-changes
+    # Skip gracefully instead of failing when nothing relevant changed. The
+    # job simply does not instantiate, and required-status-check configuration
+    # should therefore target `detect-changes`, not `plan`.
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # One broken environment must not hide the state of the other two - a
+      # reviewer wants the full picture in a single run.
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(needs.detect-changes.outputs.environments) }}
+    defaults:
+      run:
+        # Every `run` step executes inside the environment's root module unless
+        # it explicitly overrides working-directory (the repo-wide `fmt` check
+        # below does exactly that).
+        working-directory: envs/${{ matrix.environment }}
+    env:
+      # ---- Backend + provider authentication, OIDC only, zero secrets. ----
+      # ARM_USE_OIDC lets both the azurerm provider and the azurerm backend
+      # exchange the Actions-issued ID token for an Azure AD token.
+      # ARM_USE_AZUREAD makes the backend talk to the state storage account
+      # with Azure AD RBAC (Storage Blob Data Contributor) instead of a shared
+      # account key - so no storage key ever needs to exist or be rotated.
+      ARM_USE_OIDC: 'true'
+      ARM_USE_AZUREAD: 'true'
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          # terraform_wrapper MUST be false here.
+          #
+          # The wrapper re-emits Terraform's stdout/stderr with its own
+          # decoration and truncates it into step outputs. We read the raw
+          # `terraform show` output to build the PR comment, and the wrapper
+          # mangles that text (interleaved stderr, ::debug:: lines, trailing
+          # control characters) which produces an unreadable diff in the
+          # comment body. We capture output to files ourselves instead.
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC federated credential, no secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Formatting is checked once per matrix leg. That is mildly redundant,
+      # but it keeps each leg self-contained: a single job log tells you
+      # everything about that environment's health.
+      - name: Terraform fmt (whole repository)
+        id: fmt
+        # Override the job default: `-recursive` from the repo root also covers
+        # modules/, bootstrap/ and the other env directories.
+        working-directory: ${{ github.workspace }}
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform init (partial backend config)
+        id: init
+        # The backend block in backend.tf is intentionally empty. All four
+        # coordinates are injected here from GitHub repository *variables*
+        # (not secrets - none of these are confidential, and keeping them as
+        # variables means they render in logs for debuggability).
+        run: |
+          terraform init \
+            -input=false \
+            -lock-timeout=5m \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ matrix.environment }}/terraform.tfstate"
+
+      - name: Terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Set up TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.53.0
+
+      - name: TFLint (ruleset init)
+        working-directory: ${{ github.workspace }}
+        env:
+          # tflint --init downloads the azurerm ruleset from GitHub Releases.
+          # Passing the ephemeral Actions token raises the anonymous API rate
+          # limit from 60/h (shared across the whole runner pool) to 1000/h.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: tflint --init --config="${GITHUB_WORKSPACE}/.tflint.hcl"
+
+      - name: TFLint (recursive)
+        id: tflint
+        working-directory: ${{ github.workspace }}
+        run: |
+          # --recursive makes tflint chdir into every directory containing
+          # .tf files, which breaks a *relative* --config path. An absolute
+          # path is required so every module is linted against the single
+          # repo-root ruleset rather than silently falling back to defaults.
+          tflint --recursive --format=compact --config="${GITHUB_WORKSPACE}/.tflint.hcl"
+
+      - name: Checkov (static analysis)
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          config_file: .checkov.yml
+          # Hard gate. A security finding should block the PR, not decorate it.
+          # Accepted risks belong in .checkov.yml `skip-check` with a comment,
+          # or in an inline `# checkov:skip=CKV_...:<justification>` annotation,
+          # so every exception is reviewable in git history.
+          soft_fail: false
+          output_format: cli
+          quiet: true
+
+      - name: Terraform plan
+        id: plan
+        # continue-on-error so a failing plan still produces a PR comment
+        # explaining *why* it failed. The job is failed explicitly in the last
+        # step - see "Fail the job if the plan failed".
+        continue-on-error: true
+        run: |
+          terraform plan \
+            -input=false \
+            -lock-timeout=5m \
+            -no-color \
+            -out=tfplan
+
+      - name: Render machine-readable plan
+        id: plan-json
+        if: steps.plan.outcome == 'success'
+        run: terraform show -json tfplan > tfplan.json
+
+      - name: Install conftest (pinned + checksum verified)
+        if: steps.plan.outcome == 'success'
+        env:
+          CONFTEST_VERSION: '0.56.0'
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          base="https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}"
+          archive="conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz"
+
+          curl -fsSL -o "${archive}"     "${base}/${archive}"
+          curl -fsSL -o checksums.txt    "${base}/checksums.txt"
+
+          # Supply-chain hygiene: a pinned version alone proves nothing if the
+          # download is tampered with in transit or the release is re-cut.
+          # Verify the published SHA-256 before the binary is ever executed.
+          sha256sum --ignore-missing --check checksums.txt
+
+          tar -xzf "${archive}" conftest
+          sudo install -m 0755 conftest /usr/local/bin/conftest
+          conftest --version
+
+      - name: Conftest (OPA policy gate on the plan)
+        id: conftest
+        if: steps.plan.outcome == 'success'
+        run: |
+          # Policies assert on the *plan*, not on HCL - so they can reason
+          # about computed values, resource counts and planned deletions that
+          # a static HCL scanner cannot see.
+          #
+          # --all-namespaces: policies are organised one Rego package per
+          # concern (e.g. package aks.security, package tagging). Without this
+          # flag conftest only evaluates `package main` and would silently
+          # pass everything.
+          conftest test \
+            --policy "${GITHUB_WORKSPACE}/policy/conftest" \
+            --all-namespaces \
+            tfplan.json
+
+      - name: Render human-readable plan
+        if: always() && steps.plan.outcome != 'skipped'
+        run: |
+          # `terraform show` on the saved plan file is deterministic and does
+          # not re-contact Azure, unlike re-running plan for display purposes.
+          if [ -f tfplan ]; then
+            terraform show -no-color tfplan > plan.txt
+          else
+            echo "Plan file was not produced - terraform plan failed before writing tfplan." > plan.txt
+          fi
+
+      - name: Upload plan artifact
+        if: always() && steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            envs/${{ matrix.environment }}/tfplan
+            envs/${{ matrix.environment }}/tfplan.json
+          # A plan file is NOT a safe public object: it can embed values that
+          # Terraform marks sensitive only at render time, resource IDs, subnet
+          # CIDRs and tenant identifiers. Hence:
+          #   * short retention - it exists to be downloaded by a reviewer
+          #     during the life of the PR, not archived;
+          #   * artifacts inherit repository read access, so this repo should
+          #     stay private or the plan should be encrypted before upload;
+          #   * it is never attached to the PR comment verbatim.
+          retention-days: 5
+          if-no-files-found: error
+          compression-level: 9
+
+      # -------------------------------------------------------------------
+      # Sticky PR comment. One comment per environment, updated in place.
+      # -------------------------------------------------------------------
+      - name: Publish plan to the pull request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          # Everything the script needs arrives via env, never via `${{ }}`
+          # interpolation inside the JS body. Interpolating workflow context
+          # straight into a script is the classic Actions script-injection
+          # vector; env vars are passed as data and cannot break out.
+          TF_ENVIRONMENT: ${{ matrix.environment }}
+          TF_PLAN_FILE: envs/${{ matrix.environment }}/plan.txt
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          TFLINT_OUTCOME: ${{ steps.tflint.outcome }}
+          CHECKOV_OUTCOME: ${{ steps.checkov.outcome }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          CONFTEST_OUTCOME: ${{ steps.conftest.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const environment = process.env.TF_ENVIRONMENT;
+            // Hidden HTML marker: invisible when rendered, but searchable in
+            // the raw comment body. This is what makes the comment "sticky" -
+            // we update it instead of appending a new wall of text on every
+            // push, which otherwise makes a long-lived PR unreadable.
+            const marker = `<!-- tf-plan:${environment} -->`;
+
+            // GitHub hard-caps an issue comment at 65536 characters. We leave
+            // headroom for the table, headings and the truncation notice.
+            const MAX_PLAN_CHARS = 65000;
+
+            const icon = (outcome) => {
+              switch (outcome) {
+                case 'success': return 'OK';
+                case 'failure': return 'FAIL';
+                case 'skipped': return 'skipped';
+                case 'cancelled': return 'cancelled';
+                default: return 'not run';
+              }
+            };
+            const badge = (outcome) => {
+              switch (outcome) {
+                case 'success': return '✅';
+                case 'failure': return '❌';
+                case 'skipped': return '⏭️';
+                case 'cancelled': return '⚠️';
+                default: return '➖';
+              }
+            };
+
+            const steps = [
+              ['Format',   process.env.FMT_OUTCOME],
+              ['Init',     process.env.INIT_OUTCOME],
+              ['Validate', process.env.VALIDATE_OUTCOME],
+              ['TFLint',   process.env.TFLINT_OUTCOME],
+              ['Checkov',  process.env.CHECKOV_OUTCOME],
+              ['Plan',     process.env.PLAN_OUTCOME],
+              ['Conftest (OPA)', process.env.CONFTEST_OUTCOME],
+            ];
+
+            let planText;
+            try {
+              planText = fs.readFileSync(process.env.TF_PLAN_FILE, 'utf8');
+            } catch (err) {
+              planText = `Plan output is unavailable (${err.message}).`;
+            }
+            if (!planText.trim()) {
+              planText = 'Plan produced no output.';
+            }
+
+            let truncationNotice = '';
+            if (planText.length > MAX_PLAN_CHARS) {
+              planText = planText.slice(0, MAX_PLAN_CHARS);
+              truncationNotice =
+                '\n> [!WARNING]\n' +
+                '> **Plan output was truncated** to fit GitHub’s comment size limit.\n' +
+                `> Download the complete plan from the [workflow run artifacts](${process.env.RUN_URL}) ` +
+                `(artifact \`tfplan-${environment}-${context.runId}-${process.env.GITHUB_RUN_ATTEMPT || '1'}\`).\n`;
+            }
+
+            const overallFailed = steps.some(([, outcome]) => outcome === 'failure');
+            const headline = overallFailed
+              ? `❌ Terraform plan for \`${environment}\` needs attention`
+              : `✅ Terraform plan for \`${environment}\``;
+
+            const table = [
+              '| Stage | Result |',
+              '| --- | :---: |',
+              ...steps.map(([label, outcome]) => `| ${label} | ${badge(outcome)} ${icon(outcome)} |`),
+            ].join('\n');
+
+            const body = [
+              marker,
+              `### ${headline}`,
+              '',
+              table,
+              '',
+              truncationNotice,
+              '<details>',
+              `<summary>Show <code>terraform plan</code> output for <code>${environment}</code></summary>`,
+              '',
+              '```terraform',
+              planText,
+              '```',
+              '',
+              '</details>',
+              '',
+              `<sub>Triggered by @${process.env.ACTOR} · commit \`${context.sha.slice(0, 7)}\` · ` +
+                `[run #${context.runNumber}](${process.env.RUN_URL}) · ` +
+                'applies are gated behind GitHub Environment approval and never run from this workflow.</sub>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            // Paginate: on a busy PR the plan comment can fall off page 1.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(
+              (c) => c.body && c.body.includes(marker) && c.user && c.user.type === 'Bot'
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing plan comment ${existing.id} for ${environment}.`);
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              core.info(`Created plan comment for ${environment}.`);
+            }
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Terraform plan - \`${{ matrix.environment }}\`"
+            echo ""
+            echo "| Stage | Result |"
+            echo "| --- | :---: |"
+            echo "| Format | ${{ steps.fmt.outcome }} |"
+            echo "| Init | ${{ steps.init.outcome }} |"
+            echo "| Validate | ${{ steps.validate.outcome }} |"
+            echo "| TFLint | ${{ steps.tflint.outcome }} |"
+            echo "| Checkov | ${{ steps.checkov.outcome }} |"
+            echo "| Plan | ${{ steps.plan.outcome }} |"
+            echo "| Conftest | ${{ steps.conftest.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The plan step runs with continue-on-error so that the reporting steps
+      # above always get a chance to run. That means we have to re-assert the
+      # failure here, otherwise a broken plan would merge as a green check.
+      - name: Fail the job if the plan failed
+        if: steps.plan.outcome == 'failure'
+        run: |
+          echo "::error title=Terraform plan failed::terraform plan failed for environment '${{ matrix.environment }}'. See the plan output in the pull request comment above."
+          exit 1

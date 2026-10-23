@@ -1,0 +1,423 @@
+# ---------------------------------------------------------------------------
+# drift-detection.yml
+#
+# Answers one question every morning, per environment: "does Azure still look
+# like the code says it should?"
+#
+# Drift happens even in well-run estates - someone fixes an incident in the
+# portal at 02:00, an Azure Policy remediation task mutates a tag, a platform
+# upgrade bumps an AKS orchestrator version. Code that silently disagrees with
+# reality is worse than no code, because the next `terraform apply` will
+# "helpfully" revert the emergency fix.
+#
+# Mechanics: `terraform plan -detailed-exitcode` returns
+#     0 -> no changes (infrastructure matches code)
+#     1 -> error (auth, backend, provider, HCL)
+#     2 -> changes present (drift, or un-applied committed code)
+#
+# This workflow is READ-ONLY. It plans; it never applies. The remediation
+# decision - revert the portal change, or codify it - belongs to a human.
+# ---------------------------------------------------------------------------
+name: Drift Detection
+
+on:
+  schedule:
+    # 05:00 UTC daily - early enough that a drift issue is waiting at the top
+    # of the inbox before the working day starts.
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  # Required to open, comment on and close the per-environment drift issues.
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: '1.9.8'
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  detect:
+    name: Drift (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Drift in dev tells you nothing about prod. Every environment must be
+      # checked on every run, so one broken environment cannot mask the others.
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+    defaults:
+      run:
+        working-directory: envs/${{ matrix.environment }}
+    env:
+      ARM_USE_OIDC: 'true'
+      ARM_USE_AZUREAD: 'true'
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          # The wrapper swallows the process exit code and replaces it with its
+          # own, which would destroy the -detailed-exitcode signal this entire
+          # workflow is built on.
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC federated credential, no secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init (partial backend config)
+        run: |
+          terraform init \
+            -input=false \
+            -lock-timeout=5m \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}" \
+            -backend-config="key=${{ matrix.environment }}/terraform.tfstate"
+
+      - name: Terraform plan (detailed exit code)
+        id: drift
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          # errexit MUST be off around the plan: exit code 2 is the SUCCESS
+          # case we are hunting for, and `set -e` would abort the step before
+          # we ever read it. Capture $? on the very next line - any command in
+          # between (even `echo`) overwrites it.
+          set +e
+          terraform plan \
+            -detailed-exitcode \
+            -input=false \
+            -lock-timeout=5m \
+            -no-color \
+            > drift-plan.txt 2>&1
+          exit_code=$?
+          set -e
+
+          echo "exitcode=${exit_code}" >> "$GITHUB_OUTPUT"
+
+          case "${exit_code}" in
+            0)
+              echo "status=clean"   >> "$GITHUB_OUTPUT"
+              echo "No drift detected in '${{ matrix.environment }}'."
+              ;;
+            2)
+              echo "status=drifted" >> "$GITHUB_OUTPUT"
+              echo "::warning title=Drift detected::Environment '${{ matrix.environment }}' no longer matches the committed configuration."
+              ;;
+            *)
+              echo "status=error"   >> "$GITHUB_OUTPUT"
+              echo "::error title=Drift check failed::terraform plan exited ${exit_code} for '${{ matrix.environment }}'."
+              ;;
+          esac
+
+          # Echo the plan into the job log regardless - when the check errors,
+          # this is the only diagnostic available.
+          cat drift-plan.txt
+
+          # The step itself always succeeds; the verdict travels via outputs so
+          # the reporting steps below are guaranteed to run.
+          exit 0
+
+      - name: Summarise change counts
+        id: counts
+        if: steps.drift.outputs.status == 'drifted'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Re-plan to JSON purely for counting. Cheap relative to the refresh
+          # that already happened, and gives a precise blast-radius line in the
+          # issue instead of "something changed".
+          if terraform plan -input=false -lock-timeout=5m -no-color -out=tfdrift >/dev/null 2>&1 \
+             && terraform show -json tfdrift > tfdrift.json 2>/dev/null; then
+            create=$(jq '[.resource_changes[]? | select(.change.actions == ["create"])] | length' tfdrift.json)
+            update=$(jq '[.resource_changes[]? | select(.change.actions == ["update"])] | length' tfdrift.json)
+            delete=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' tfdrift.json)
+            addrs=$(jq -r '[.resource_changes[]? | select(.change.actions != ["no-op"]) | .address] | .[0:25] | .[]' tfdrift.json)
+          else
+            create=0; update=0; delete=0; addrs=""
+          fi
+
+          echo "create=${create}" >> "$GITHUB_OUTPUT"
+          echo "update=${update}" >> "$GITHUB_OUTPUT"
+          echo "delete=${delete}" >> "$GITHUB_OUTPUT"
+          {
+            echo "addresses<<ADDR_EOF"
+            echo "${addrs}"
+            echo "ADDR_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          rm -f tfdrift tfdrift.json
+
+      # -------------------------------------------------------------------
+      # Issue lifecycle management.
+      #
+      # The senior touch here is the AUTO-CLOSE path. Plenty of pipelines open
+      # a drift issue; far fewer close it. Without auto-close you accumulate a
+      # backlog of stale "drift detected" issues, nobody can tell which are
+      # still real, and the whole signal gets muted within a fortnight. Because
+      # this workflow is the single source of truth for drift state, it is also
+      # the only thing qualified to declare drift resolved - so it does, with a
+      # comment explaining what it saw, and the issue closes itself.
+      #
+      # Exactly one open issue per environment is maintained, identified by a
+      # hidden marker in the body plus the `drift` + `env:<name>` label pair.
+      # Repeat detections UPDATE that issue rather than filing a new one.
+      # -------------------------------------------------------------------
+      - name: Manage drift issue
+        if: always() && steps.drift.outputs.status != 'error'
+        uses: actions/github-script@v7
+        env:
+          DRIFT_ENVIRONMENT: ${{ matrix.environment }}
+          DRIFT_STATUS: ${{ steps.drift.outputs.status }}
+          DRIFT_PLAN_FILE: envs/${{ matrix.environment }}/drift-plan.txt
+          DRIFT_CREATE: ${{ steps.counts.outputs.create }}
+          DRIFT_UPDATE: ${{ steps.counts.outputs.update }}
+          DRIFT_DELETE: ${{ steps.counts.outputs.delete }}
+          DRIFT_ADDRESSES: ${{ steps.counts.outputs.addresses }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const environment = process.env.DRIFT_ENVIRONMENT;
+            const status = process.env.DRIFT_STATUS;
+            const runUrl = process.env.RUN_URL;
+            const { owner, repo } = context.repo;
+
+            const marker = `<!-- drift-detector:${environment} -->`;
+            const title = `[drift] Infrastructure drift detected in \`${environment}\``;
+            const labels = ['drift', `env:${environment}`];
+
+            // ISO-8601 UTC, no locale ambiguity for whoever reads the issue.
+            const timestamp = new Date().toISOString().replace('T', ' ').replace(/\..+/, ' UTC');
+
+            // GitHub caps an issue body at 65536 chars; leave room for the
+            // surrounding template.
+            const MAX_PLAN_CHARS = 55000;
+
+            // ---- Labels must exist before they can be applied. The API will
+            // usually create them implicitly, but doing it explicitly makes the
+            // colour/description deterministic and the failure mode obvious.
+            const ensureLabel = async (name, color, description) => {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch (err) {
+                if (err.status !== 404) throw err;
+                try {
+                  await github.rest.issues.createLabel({ owner, repo, name, color, description });
+                  core.info(`Created label '${name}'.`);
+                } catch (createErr) {
+                  // 422 = created concurrently by a sibling matrix job. Benign.
+                  if (createErr.status !== 422) throw createErr;
+                }
+              }
+            };
+            await ensureLabel('drift', 'd93f0b', 'Deployed infrastructure no longer matches committed Terraform');
+            await ensureLabel(`env:${environment}`, '0366d6', `Relates to the ${environment} environment`);
+
+            // ---- Find the single open drift issue for this environment.
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              labels: labels.join(','),
+              per_page: 100,
+            });
+            const existing = openIssues.find(
+              (i) => !i.pull_request && ((i.body || '').includes(marker) || i.title === title)
+            );
+
+            // ---------------- DRIFT PRESENT ----------------
+            if (status === 'drifted') {
+              let planText = '';
+              try {
+                planText = fs.readFileSync(process.env.DRIFT_PLAN_FILE, 'utf8');
+              } catch (err) {
+                planText = `Plan output unavailable (${err.message}).`;
+              }
+
+              let truncated = '';
+              if (planText.length > MAX_PLAN_CHARS) {
+                planText = planText.slice(0, MAX_PLAN_CHARS);
+                truncated = `\n> [!NOTE]\n> Plan output truncated. Full output in the [workflow run](${runUrl}).\n`;
+              }
+
+              const n = (v) => (v === undefined || v === '' ? '?' : v);
+              const addresses = (process.env.DRIFT_ADDRESSES || '')
+                .split('\n')
+                .map((s) => s.trim())
+                .filter(Boolean)
+                .map((a) => `- \`${a}\``)
+                .join('\n') || '- _(unable to enumerate - see plan output)_';
+
+              const body = [
+                marker,
+                `## Drift detected in \`${environment}\``,
+                '',
+                `\`terraform plan -detailed-exitcode\` returned **2** at **${timestamp}**, meaning the`,
+                'deployed infrastructure no longer matches the configuration committed to `main`.',
+                '',
+                '| Planned action | Count |',
+                '| --- | ---: |',
+                `| create | ${n(process.env.DRIFT_CREATE)} |`,
+                `| update in place | ${n(process.env.DRIFT_UPDATE)} |`,
+                `| destroy | ${n(process.env.DRIFT_DELETE)} |`,
+                '',
+                '### Affected addresses (first 25)',
+                '',
+                addresses,
+                '',
+                truncated,
+                '<details>',
+                '<summary>Show full <code>terraform plan</code> output</summary>',
+                '',
+                '```terraform',
+                planText,
+                '```',
+                '',
+                '</details>',
+                '',
+                '### What to do',
+                '',
+                '1. **Read the plan before acting.** A `destroy` line means something was created',
+                '   outside Terraform, or something Terraform owns was deleted in the portal.',
+                '2. Decide which side is right:',
+                '   - the change was a legitimate fix -> **codify it** in `envs/' + environment + '/`',
+                '     and open a PR, so the next apply does not revert it;',
+                '   - the change was unintended -> let the next approved apply **revert it**.',
+                '3. Never run `terraform apply` straight from a drift report. Go through',
+                '   `terraform-plan.yml` on a PR so the policy and security gates still apply.',
+                '',
+                '> This issue is maintained automatically: it is updated on each detection and',
+                '> **closed automatically** once a run reports no drift.',
+                '',
+                `<sub>Last checked: ${timestamp} · [workflow run](${runUrl})</sub>`,
+              ].join('\n');
+
+              if (existing) {
+                // Update in place rather than filing a new issue every single
+                // night - otherwise one unresolved drift produces 30 identical
+                // issues a month and the label becomes noise.
+                await github.rest.issues.update({
+                  owner, repo, issue_number: existing.number, title, body, state: 'open',
+                });
+                core.warning(`Updated existing drift issue #${existing.number} for '${environment}'.`);
+                core.setOutput('issue', String(existing.number));
+              } else {
+                const created = await github.rest.issues.create({
+                  owner, repo, title, body, labels,
+                });
+                core.warning(`Opened drift issue #${created.data.number} for '${environment}'.`);
+                core.setOutput('issue', String(created.data.number));
+              }
+              return;
+            }
+
+            // ---------------- NO DRIFT ----------------
+            if (status === 'clean') {
+              if (!existing) {
+                core.info(`No drift in '${environment}' and no open drift issue. Nothing to do.`);
+                return;
+              }
+
+              // AUTO-CLOSE. Leaving resolved drift issues open is how drift
+              // alerting dies: within weeks nobody can tell a live issue from a
+              // stale one, so nobody looks. Closing with an explicit comment
+              // keeps the audit trail (what drifted, when it cleared) while
+              // keeping the open-issue list meaningful.
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body: [
+                  `### Drift resolved in \`${environment}\``,
+                  '',
+                  `\`terraform plan -detailed-exitcode\` returned **0** at **${timestamp}** -`,
+                  'the deployed infrastructure now matches the committed configuration.',
+                  '',
+                  'Closing automatically. If drift reappears, this detector will open a new issue',
+                  'rather than reopening this one, so each occurrence keeps its own timeline.',
+                  '',
+                  `<sub>Verified by [this workflow run](${runUrl}).</sub>`,
+                ].join('\n'),
+              });
+
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+
+              core.info(`Closed resolved drift issue #${existing.number} for '${environment}'.`);
+            }
+
+      - name: Write job summary
+        if: always()
+        env:
+          DRIFT_STATUS: ${{ steps.drift.outputs.status }}
+          DRIFT_EXITCODE: ${{ steps.drift.outputs.exitcode }}
+        run: |
+          set -euo pipefail
+
+          case "${DRIFT_STATUS:-error}" in
+            clean)   verdict="✅ **No drift** - Azure matches the committed configuration." ;;
+            drifted) verdict="⚠️ **Drift detected** - a tracking issue has been opened or updated." ;;
+            *)       verdict="❌ **Check failed** - the plan could not complete; see the job log." ;;
+          esac
+
+          {
+            echo "## Drift check - \`${{ matrix.environment }}\`"
+            echo ""
+            echo "${verdict}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Environment | \`${{ matrix.environment }}\` |"
+            echo "| State key | \`${{ matrix.environment }}/terraform.tfstate\` |"
+            echo "| \`-detailed-exitcode\` | \`${DRIFT_EXITCODE:-n/a}\` (0=clean, 1=error, 2=drift) |"
+            echo "| Checked at | \`$(date -u '+%Y-%m-%d %H:%M:%S UTC')\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${DRIFT_STATUS:-error}" = "drifted" ] && [ -f "drift-plan.txt" ]; then
+            {
+              echo "<details><summary>Show plan output</summary>"
+              echo ""
+              echo '```terraform'
+              head -c 50000 drift-plan.txt
+              echo ""
+              echo '```'
+              echo ""
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Drift (exit 2) is a FINDING, not a pipeline failure - the issue is the
+      # deliverable and a red X every morning trains people to ignore the
+      # workflow. A genuine error (exit 1) IS a pipeline failure: it means the
+      # detector is blind, which is the one outcome that must page someone.
+      - name: Fail the job only on detector errors
+        if: steps.drift.outputs.status == 'error'
+        run: |
+          echo "::error title=Drift detector failed::Could not evaluate drift for '${{ matrix.environment }}' (terraform plan exit code ${{ steps.drift.outputs.exitcode }}). The environment is currently UNMONITORED."
+          exit 1

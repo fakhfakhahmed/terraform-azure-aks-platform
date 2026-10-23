@@ -1,0 +1,212 @@
+# ---------------------------------------------------------------------------
+# security.yml
+#
+# Continuous security posture for the IaC itself. Three independent scanners,
+# each covering a different failure mode:
+#
+#   checkov   - opinionated IaC misconfiguration rules (public ingress,
+#               unencrypted disks, missing diagnostic settings, ...)
+#   trivy     - a second, independently maintained rule set over the same
+#               Terraform, plus Dockerfile/Kubernetes manifests if they appear
+#   gitleaks  - credentials accidentally committed to git history
+#
+# Running checkov in BOTH this workflow and terraform-plan.yml is intentional
+# and not redundant:
+#   * in terraform-plan.yml it is a hard PR gate (soft_fail: false) - it stops
+#     a bad change from merging;
+#   * here it is a reporting job that feeds the GitHub Security tab via SARIF,
+#     and runs weekly so that NEW rules shipped by the scanner are applied to
+#     code that was merged before those rules existed. A repo that only scans
+#     on PR silently rots as the rule sets improve.
+# ---------------------------------------------------------------------------
+name: Security Scan
+
+on:
+  schedule:
+    # Mondays 06:00 UTC. Weekly re-scan of unchanged code catches newly
+    # published CVEs and newly published scanner rules.
+    - cron: '0 6 * * 1'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# security-events: write -> upload SARIF to code scanning
+# actions: read          -> required by codeql-action/upload-sarif to correlate
+#                           the SARIF with the workflow run on private repos
+# NOTE: no id-token here. None of these scanners talk to Azure; they read files
+# off disk. Not minting an OIDC token for jobs that cannot use it is the point
+# of least privilege.
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Checkov -> SARIF -> Security tab
+  # -------------------------------------------------------------------------
+  checkov:
+    name: Checkov (IaC misconfiguration)
+    runs-on: ubuntu-latest
+    strategy:
+      # Each scanner is an independent signal. One failing must not suppress
+      # the others' findings - a half-populated Security tab is worse than
+      # none because it looks complete.
+      fail-fast: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        id: checkov
+        # continue-on-error is the deliberate choice here.
+        #
+        # The scan step exits non-zero when it finds something. If the step
+        # hard-fails, the job aborts and the SARIF upload below never runs -
+        # which means the moment there is an actual finding, the Security tab
+        # stops being updated. That is exactly backwards.
+        #
+        # So: tolerate the scan's exit code, ALWAYS upload the SARIF, and let
+        # the Security tab (plus code-scanning branch protection, if enabled)
+        # be the thing that gates. The hard PR gate already lives in
+        # terraform-plan.yml.
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          config_file: .checkov.yml
+          # Two outputs from one run: `cli` to the job log so a failure is
+          # readable without leaving Actions, and `sarif` to a file for the
+          # Security tab. The two lists are positional - index N of
+          # output_format pairs with index N of output_file_path, and the
+          # literal `console` sink means "write this one to stdout".
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          soft_fail: true
+          quiet: true
+          download_external_modules: false
+
+      - name: Upload Checkov SARIF
+        # `always()` so findings are published even if the scanner itself
+        # errored out partway through.
+        if: always() && hashFiles('checkov-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          # A distinct category per tool is REQUIRED. Code scanning keys alerts
+          # on (ref, category); two tools uploading under the same category
+          # makes each run mark the other tool's alerts as "fixed", so alerts
+          # flap open and closed forever.
+          category: checkov
+
+  # -------------------------------------------------------------------------
+  # Trivy config scan -> SARIF -> Security tab
+  # -------------------------------------------------------------------------
+  trivy:
+    name: Trivy (IaC config scan)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy config scan
+        id: trivy
+        continue-on-error: true
+        # Pinned to an exact release rather than a major tag: this action can
+        # upload results to the Security tab, which makes it security-sensitive
+        # enough to want byte-stable behaviour between runs.
+        #
+        # NOTE ON tfsec: tfsec is no longer developed as a standalone tool -
+        # Aqua Security folded its Terraform rule set into Trivy's misconfig
+        # scanner (`scan-type: config`). This job IS the tfsec coverage; adding
+        # a separate tfsec step today would only re-run stale rules.
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          # Report-only: the gate is terraform-plan.yml. See the checkov
+          # comment above for why the scan step must not abort the job.
+          exit-code: '0'
+          hide-progress: true
+
+      - name: Upload Trivy SARIF
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-config
+
+  # -------------------------------------------------------------------------
+  # Gitleaks - secret detection across the full git history
+  # -------------------------------------------------------------------------
+  gitleaks:
+    name: Gitleaks (secret detection)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 is MANDATORY for secret scanning.
+          #
+          # The default shallow clone (depth 1) only contains the tip commit, so
+          # gitleaks would scan the current working tree and report clean while
+          # a leaked storage account key sits three commits back in history.
+          # A secret that was committed and then "removed" in a later commit is
+          # still a leaked secret - it is reachable forever via the object
+          # store. Scanning full history is the only way to see it.
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE is only required for repositories owned by a
+          # GitHub *Organization*. This repo is owned by a personal account, so
+          # the action runs unlicensed and free. If you later move it into an
+          # org, add the licence key as a repository secret and uncomment:
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_SUMMARY: 'true'
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
+
+  # -------------------------------------------------------------------------
+  # Aggregate status so branch protection has one check to require, and so a
+  # scheduled run surfaces a single readable verdict.
+  # -------------------------------------------------------------------------
+  report:
+    name: Security scan summary
+    runs-on: ubuntu-latest
+    needs: [checkov, trivy, gitleaks]
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## Security scan results"
+            echo ""
+            echo "| Scanner | Scope | Job result |"
+            echo "| --- | --- | :---: |"
+            echo "| Checkov | Terraform misconfiguration | \`${{ needs.checkov.result }}\` |"
+            echo "| Trivy | IaC config (includes former tfsec rules) | \`${{ needs.trivy.result }}\` |"
+            echo "| Gitleaks | Secrets in full git history | \`${{ needs.gitleaks.result }}\` |"
+            echo ""
+            echo "Findings are published to the repository **Security -> Code scanning** tab,"
+            echo "each under its own category so the tools do not overwrite each other's alerts."
+            echo ""
+            echo "> Scan steps run with \`continue-on-error\` so that SARIF is uploaded even when"
+            echo "> findings exist. The hard merge gate is \`terraform-plan.yml\` (Checkov with"
+            echo "> \`soft_fail: false\`) plus the Conftest/OPA policy gate."
+          } >> "$GITHUB_STEP_SUMMARY"

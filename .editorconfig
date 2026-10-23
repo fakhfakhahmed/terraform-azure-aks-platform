@@ -1,0 +1,68 @@
+# EditorConfig helps maintain consistent coding styles across editors and IDEs.
+# https://editorconfig.org
+#
+# This matters more than it looks: `terraform fmt -check -recursive` runs as a
+# blocking CI gate, and a contributor whose editor inserts tabs or CRLF will
+# fail the pipeline before a human ever reads the change. This file removes
+# that class of friction entirely.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+max_line_length = 120
+
+# Terraform's canonical style is 2-space indentation with aligned `=` signs.
+# `terraform fmt` enforces this; EditorConfig keeps editors from fighting it.
+[*.{tf,tfvars,hcl}]
+indent_style = space
+indent_size = 2
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.json]
+indent_style = space
+indent_size = 2
+
+[*.md]
+# Markdown uses two trailing spaces for a hard line break, so trimming
+# trailing whitespace would silently change rendered output.
+trim_trailing_whitespace = false
+max_line_length = off
+
+# Rego (Open Policy Agent) -- `opa fmt` uses tabs by default.
+[*.rego]
+indent_style = tab
+
+# PowerShell on Windows is conventionally 4-space indented. These scripts are
+# the primary operator interface on the author's Windows 11 workstation.
+[*.ps1]
+indent_size = 4
+# Windows PowerShell 5.1 tolerates LF, but CRLF is the platform norm and avoids
+# noisy diffs when the file is edited in the ISE or Notepad.
+end_of_line = crlf
+
+# Shell scripts MUST be LF-terminated. A CRLF shebang line produces the
+# infamous `bad interpreter: /usr/bin/env bash^M: no such file or directory`
+# when the script runs on a Linux CI runner.
+[*.sh]
+indent_size = 2
+end_of_line = lf
+
+[Makefile]
+# Make requires literal tabs for recipe lines. Non-negotiable.
+indent_style = tab
+
+[*.{bat,cmd}]
+end_of_line = crlf
+
+[{.gitignore,.gitattributes,.dockerignore}]
+indent_style = space
+indent_size = 2
