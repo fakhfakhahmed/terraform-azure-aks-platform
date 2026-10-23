@@ -23,7 +23,7 @@ terraform {
       #   2. Several arguments were renamed, e.g.
       #      enable_https_traffic_only -> https_traffic_only_enabled.
       # Pinning to ~> 4.0 keeps us on 4.x and off the 5.x breaking changes.
-      version = "~> 4.0"
+      version = "~> 5.10"
     }
 
     azuread = {
