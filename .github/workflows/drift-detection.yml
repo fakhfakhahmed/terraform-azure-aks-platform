@@ -63,10 +63,10 @@ jobs:
       ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Terraform ${{ env.TERRAFORM_VERSION }}
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           # The wrapper swallows the process exit code and replaces it with its
@@ -75,7 +75,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Azure login (OIDC federated credential, no secrets)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -183,7 +183,7 @@ jobs:
       # -------------------------------------------------------------------
       - name: Manage drift issue
         if: always() && steps.drift.outputs.status != 'error'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           DRIFT_ENVIRONMENT: ${{ matrix.environment }}
           DRIFT_STATUS: ${{ steps.drift.outputs.status }}

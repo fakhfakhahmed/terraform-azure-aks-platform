@@ -81,7 +81,7 @@ jobs:
       has-changes: ${{ steps.matrix.outputs.has-changes }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Classify changed paths
         id: filter
@@ -89,7 +89,7 @@ jobs:
         # pull_request events. On workflow_dispatch we skip it and fan out to
         # every environment instead (see the next step).
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             shared:
@@ -195,10 +195,10 @@ jobs:
       ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Terraform ${{ env.TERRAFORM_VERSION }}
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           # terraform_wrapper MUST be false here.
@@ -212,7 +212,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Azure login (OIDC federated credential, no secrets)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -248,7 +248,7 @@ jobs:
         run: terraform validate -no-color
 
       - name: Set up TFLint
-        uses: terraform-linters/setup-tflint@v4
+        uses: terraform-linters/setup-tflint@v6
         with:
           tflint_version: v0.53.0
 
@@ -356,7 +356,7 @@ jobs:
 
       - name: Upload plan artifact
         if: always() && steps.plan.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tfplan-${{ matrix.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -379,7 +379,7 @@ jobs:
       # -------------------------------------------------------------------
       - name: Publish plan to the pull request
         if: always() && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           # Everything the script needs arrives via env, never via `${{ }}`
           # interpolation inside the JS body. Interpolating workflow context

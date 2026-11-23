@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Check out the PR *branch*, not the merge commit. The default
           # refs/pull/N/merge ref is detached, so a commit made on top of it
